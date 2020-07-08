@@ -8,6 +8,7 @@ edition = "2018"
 
 [dependencies]
 crossterm = { version = "0.17.5", features = ["event-stream"] }
+unicode-width = "*"
 futures = "0.3"
 futures-timer = "3"
 async-std = "1.6"

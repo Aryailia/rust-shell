@@ -1,15 +1,14 @@
-use std::io::Write;
 use futures::{future, Stream, StreamExt};
-use std::process::Command;
 //use futures_timer::Delay;
 use crossterm::{
+    cursor::{MoveUp, MoveLeft, MoveDown, MoveRight},
     event::{DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyModifiers},
-    terminal,
-    cursor,
     //QueueableCommand,
     style::Print,
+    terminal,
     ExecutableCommand,
 };
+use unicode_width::UnicodeWidthStr;
 
 fn main() {
     async_std::task::block_on(async {
@@ -17,99 +16,107 @@ fn main() {
     });
 }
 
-fn parse_user_input(input_stream: EventStream) -> impl Stream<Item = String> {
-    let mut line_buffer = String::with_capacity(1024);
+
+//trait IgnoreError<T: Result>: Sized {
+//    fn ignore() {
+//        result
+//
+//    }
+//}
+
+fn parse_user_input(input_stream: EventStream) -> impl Stream<Item = bool> {
+    //let mut line_buffer = String::with_capacity(1024);
     let mut stdout = std::io::stdout();
+    let emoji_list = [
+        "\u{2764}",         // heart
+        "\u{2764}\u{fe0e}", // heart
+        "\u{2764}\u{fe0f}", // heart
+        "\u{26a1}",         // lightning
+        "\u{26a1}\u{fe0e}", // lightning
+        "\u{26a1}\u{fe0f}", // lightning
+        "你好",
+        "你",
+        "これは",
+        "ａｂｃ",
+        "\u{1f469}", // woman
+        "\u{1f52c}", // microscope
+        "\u{1f469}\u{200d}\u{1f52c}", // female scientist
+    ];
     input_stream.filter_map(move |event| {
         let output = match event {
             Ok(Event::Key(e)) => match (e.code, e.modifiers) {
-                (KeyCode::Esc, _) => Some("exit".to_string()),
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                    line_buffer.clear();
-                    stdout.write(b"^C\r\n");
-                    Some(String::from(""))
+                (KeyCode::Esc, _) => Some(true),
+                (KeyCode::Char('h'), _) => {
+                    stdout.execute(MoveLeft(1)).unwrap();
+                    None
                 }
-                (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                    if line_buffer.is_empty() {
-                        Some("exit".to_string())
-                    } else {
-                        None
+                (KeyCode::Char('j'), _) => {
+                    stdout.execute(MoveDown(1)).unwrap();
+                    None
+                }
+                (KeyCode::Char('k'), _) => {
+                    stdout.execute(MoveUp(1)).unwrap();
+                    None
+                }
+                (KeyCode::Char('l'), _) => {
+                    stdout.execute(MoveRight(1)).unwrap();
+                    None
+                }
+                (KeyCode::Char('o'), _) => {
+                    stdout.execute(Print(emoji_list.join("\r\n"))).unwrap();
+                    None
+                }
+                (KeyCode::Char('p'), _) => {
+                    stdout.execute(Print(emoji_list.join(""))).unwrap();
+                    None
+                }
+                (KeyCode::Char('s'), _) => {
+                    for emoji in &emoji_list {
+                        stdout.execute(Print(UnicodeWidthStr::width(*emoji))).unwrap();
+                        stdout.execute(Print(emoji)).unwrap();
+                        stdout.execute(Print(UnicodeWidthStr::width_cjk(*emoji))).unwrap();
+                        stdout.execute(Print(" | ")).unwrap();
                     }
+                    None
+                }
+                (KeyCode::Char(' '), _) => {
+                    stdout.execute(Print(" ")).unwrap();
+                    None
+                }
+                (KeyCode::Char('1'), _) => {
+                    stdout.execute(Print("你")).unwrap();
+                    None
                 }
 
                 (KeyCode::Enter, _) => {
-                    stdout.write(b"\r\n").unwrap();
-                    Some(line_buffer.split_off(0))
-                }
-
-                (KeyCode::Backspace, _) => {
-                    if !line_buffer.is_empty() {
-                        stdout.execute(cursor::MoveLeft(1)).unwrap()
-                            .execute(Print(" ")).unwrap()
-                            .execute(cursor::MoveLeft(1)).unwrap();
-                        line_buffer.pop();
-                    }
-                    //println!()
+                    stdout.execute(Print("\r\n")).unwrap();
                     None
                 }
-
-                (KeyCode::Char(ch), _) => {
-                    stdout.execute(crossterm::style::Print(ch)).unwrap();
-                    line_buffer.push(ch);
-                    None
-                }
-                _ => None,
+                _ => {
+                    stdout.execute(Print("i")).unwrap();
+                    Some(false)
+                },
             },
-            Ok(Event::Mouse(e)) => {
-                println!("Mouse {:?}", e);
-                None
-            }
-            Ok(Event::Resize(a, b)) => {
-                //println!("Resize {:?} {:?}", a, b);
-                None
-            }
+            Ok(Event::Mouse(_)) => None,
+            Ok(Event::Resize(_, _)) => None,
             Err(_) => None,
         };
         future::ready(output)
     })
 }
 
-fn prompt() -> &'static str {
-    "> "
-}
-
 async fn repl() -> crossterm::Result<()> {
     let mut stdout = std::io::stdout();
-    let mut stderr = std::io::stderr();
 
     terminal::enable_raw_mode()?;
     stdout.execute(EnableMouseCapture)?;
 
     let event_stream = EventStream::new();
-    stdout.execute(Print(prompt()))?;
     let mut line_stream = parse_user_input(event_stream);
-    while let Some(line) = line_stream.next().await {
-        terminal::disable_raw_mode()?;
-
-        let mut args = line.split_whitespace();
-        match args.next() {
-            Some("exit") => break,
-            Some(cmd_str) => {
-                let result = Command::new(cmd_str)
-                    .args(args.collect::<Vec<_>>())
-                    .spawn()
-                    .and_then(|mut child| child.wait());
-                match result {
-                    Ok(_) => {}
-                    Err(_) => {
-                        stderr.execute(Print("Invalid command\n")).unwrap();
-                    }
-                }
-            }
-            _ => {}
+    while let Some(terminate) = line_stream.next().await {
+        if terminate {
+            break;
         }
-        terminal::enable_raw_mode()?;
-        stdout.execute(Print(prompt())).unwrap();
     }
 
     terminal::disable_raw_mode()?;
