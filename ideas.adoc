@@ -1,0 +1,23 @@
+Interactiveness:
+https://matklad.github.io/2019/11/16/a-better-shell[matklad:  A Better Shell]
+Plan9's ACME editor
+  * Plumbing and Mouse Chords
+  * Really simple API for plugin integration
+Emacs Lisp Interaction Mode
+PowerShell and NuShell for tabled/structured output rather than text
+Fish shell
+  * automatically read man for autocompletion
+Zsh
+  * good navigation for autocomplete menu
+
+Compiler Design:
+* JAI
+  * programmic access to typing (post-lexer) but before message-send allows lots of static analysis
+  * job system for compiling
+  * run loop before compile loop
+  * static analysis tools are written in JAI itself
+
+* Zig
+  * explicit comptime (compile time) keyword for generating code at compile time
+
+

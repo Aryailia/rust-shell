@@ -26,7 +26,7 @@ fn parse_user_input(input_stream: EventStream) -> impl Stream<Item = String> {
                 (KeyCode::Esc, _) => Some("exit".to_string()),
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                     line_buffer.clear();
-                    stdout.write(b"^C\r\n");
+                    stdout.write(b"^C\r\n").unwrap();
                     Some(String::from(""))
                 }
                 (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -64,7 +64,7 @@ fn parse_user_input(input_stream: EventStream) -> impl Stream<Item = String> {
                 println!("Mouse {:?}", e);
                 None
             }
-            Ok(Event::Resize(a, b)) => {
+            Ok(Event::Resize(_, _)) => {
                 //println!("Resize {:?} {:?}", a, b);
                 None
             }
