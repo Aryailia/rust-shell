@@ -26,11 +26,10 @@ impl<'a> TextGridWalk<'a> {
         }
     }
 
+    /// NOTE: we do not update self.col_index
     pub fn walk_to_line_end(&mut self) -> &str {
         self.char_source = "".chars();
         &self.cur_line[self.col_index..]
-        // NOTE: we do not update self.col_index
-        //self.col_index = self.cur_line.len();
     }
 }
 

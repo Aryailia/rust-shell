@@ -5,25 +5,14 @@ mod helpers;
 
 use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
-use helpers::{split_inclusive, TextGridWalk};
+use helpers::{split_inclusive, OwnedToOption, TextGridWalk};
 
 //enum Token {
 //    ident,
 //}
 
-enum Lexeme {
-    Text,
-    SingleQuote,
-    DoubleQuote,
-    Comment,
-    Separator,
-    EndOfCommand,
-}
-
 //const FLAG_COMMENT_STARTED: u8 = 0x01;
-const SINGLE_QUOTE_STARTED: Flag = Flag(0x02);
-const DOUBLE_QUOTE_STARTED: Flag = Flag(0x04);
-const ESCAPED: Flag = Flag(0x08);
+const DQUOTE_BEGIN: Flag = Flag(0x04);
 //const FLAG_NON_NEWLINE_WHITESPACE: u8 = 0x08;
 
 struct Flag(u8);
@@ -54,6 +43,16 @@ impl BitOr for Flag {
     }
 }
 
+use std::borrow::Cow;
+
+#[derive(Debug)]
+enum Lexeme<'a> {
+    Text(Cow<'a, str>),
+    Comment(&'a str),
+    Separator,
+    EndOfCommand,
+}
+
 struct LexerState<'a> {
     buffer: &'a str,
     buffer_walker: TextGridWalk<'a>,
@@ -71,34 +70,29 @@ impl<'a> LexerState<'a> {
         }
     }
 
-    fn emit_exclusive_token(&mut self) {
+    // Token methods
+    fn exclusive_break(&mut self) -> Option<&str> {
         let walker = &mut self.buffer_walker;
+        let start = self.token_start;
         let index = walker.row_start_index + walker.col_index;
-        if self.token_start < index {
-            emit(&self.buffer[self.token_start..index])
-        }
-        //emit("exclusive\n");
         self.token_start = index + 1;
+        (start < index).to_some(&self.buffer[start..index])
     }
 
-    fn emit_inclusive_token(&mut self) {
+    fn inclusive_break(&mut self) -> &str {
         let walker = &mut self.buffer_walker;
-        let pos = walker.row_start_index + walker.col_index + 1;
-        //assert!(self.token_start < pos)
-        //println!("debug: {} {}", self.token_start, pos);
-        emit(&self.buffer[self.token_start..pos]);
-        self.token_start = pos;
+        let start_index = self.token_start;
+        let end_pos = walker.row_start_index + walker.col_index + 1;
+        //assert!(start_index < end_pos)
+        self.token_start = end_pos;
+        &self.buffer[start_index..end_pos]
     }
 
-    fn emit_rest_of_line(&mut self) {
+    fn rest_of_line(&mut self) -> &str {
         let walker = &mut self.buffer_walker;
-        // NOTE: 'walker.walk_to_line_end()' does not update 'walker.col_index'
-        emit(walker.walk_to_line_end());
-        // Does not matter if walk_to_next_line() returned None (means we end)
         self.token_start += walker.cur_line.len();
-    }
-    fn emit_end_of_statement(&self) {
-        emit("\n");
+        // NOTE: 'walker.walk_to_line_end()' does not update 'walker.col_index'
+        walker.walk_to_line_end()
     }
 
     fn is(&self, rhs: Flag) -> bool {
@@ -119,25 +113,38 @@ impl<'a> LexerState<'a> {
             //    println!("Line: {:?}", line);
             //}
             match ch {
-                //'\\' if self.is(ESCAPED) => {
-                //    self.emit_inclusive_token();
-                //}
-                // @TODO does not work if last character is backslash
                 '\\' => {
-                    self.emit_exclusive_token();
-                    self.flags.set(ESCAPED);
-                }
-                '\n' | '\r' if self.is(ESCAPED) => {
-                    self.emit_inclusive_token();
-                }
-                '\n' | '\r' => {
-                    //print!("{}", );
-                    self.emit_exclusive_token();
-                    self.emit_end_of_statement();
+                    let walker = &mut self.buffer_walker;
+                    let cur_index = walker.row_start_index + walker.col_index;
+                    emit(self.exclusive_break());
+                    // POSIX does not specify what to do with dangling POSIX
+                    // NOTE: Backslash before EOF is intepreted literally in
+                    // dash
+                    let walker = &mut self.buffer_walker;
+                    let i = match walker.next() {
+                        // Index of the next character
+                        // same as 'walker.row_start_index + walker.col_index'
+                        Some(_) => self.token_start,  // exclusive_break() sets
+                        // Danging backslash is returned
+                        None => cur_index,
+                    };
+                    self.token_start += 1; // +2 total due to 'walker.next()'
+                    let escape_target = &self.buffer[i..i + 1];
+                    emit(Lexeme::Text(escape_target.into()));
                 }
 
-                '#' if self.is_not(ESCAPED | SINGLE_QUOTE_STARTED | DOUBLE_QUOTE_STARTED) => {
-                    self.emit_rest_of_line();
+                '\n' | '\r' => {
+                    if let Some(x) = self.exclusive_break() {
+                        emit(Lexeme::Text(x.into()));
+                        emit(Lexeme::EndOfCommand);
+                    } // 'None' means just whitespace before
+                }
+
+                //' ' if self.is_not(DQUOTE_BEGIN) => {
+                //    emit(self.exclusive_break())
+                //}
+                '#' if self.is_not(DQUOTE_BEGIN) => {
+                    emit(Lexeme::Comment(self.rest_of_line()));
                 }
                 _ => {}
             }
@@ -145,8 +152,8 @@ impl<'a> LexerState<'a> {
     }
 }
 
-fn emit(str_view: &str) {
-    println!("Token: \"{}\", ", str_view);
+fn emit<T: std::fmt::Debug>(token: T) {
+    println!("Token: {:?}", token);
 }
 
 async fn lexer(mut stream_of_scripts: impl Stream<Item = &str> + Unpin) {
@@ -167,6 +174,8 @@ main() {
   asdf='hello'
   printf %s\\n ${asdf}
 }
+
+
 "##;
     //#[test]
     fn grid() {
@@ -184,54 +193,3 @@ main() {
         lexer(script).await;
     }
 }
-
-
-
-
-//async fn lexer2(mut stream_of_scripts: impl Stream<Item = &str> + Unpin) {
-//    while let Some(body) = stream_of_scripts.next().await {
-//        // State variables
-//        //let mut escaped = true;
-//        let mut state = LexerState::new(body);
-//        let mut line_index = 0;
-//
-//        let mut line_iter = split_inclusive(body, '\n').enumerate();
-//        while let Some((_row, line)) = line_iter.next() {
-//            let mut char_iter = line.chars().enumerate();
-//
-//            // 'line_index' should increment for col
-//            // as we might process entire line
-//            while let Some((col, ch)) = char_iter.next() {
-//                match ch {
-//                    '\\' if state.is(ESCAPED) => {
-//                        //println!("hello {}", &state.flags.0);
-//                        state.emit_token_end(line_index, col);
-//                        //token_skip(start, end, processed_len);
-//                    }
-//                    // @TODO does not work if last character is backslash
-//                    '\\' => {
-//                        state.emit_exclusive_token(line_index, col);
-//                        state.flags.set(ESCAPED);
-//                    }
-//                    '\n' | '\r' if state.is(ESCAPED) => {
-//                        state.emit_token_end(line_index, col);
-//                    }
-//                    '\n' | '\r' => {
-//                        state.emit_exclusive_token(line_index, col);
-//                        state.emit_end_of_statement();
-//                    }
-//
-//                    '#' if state.is_not(ESCAPED | SINGLE_QUOTE_STARTED | DOUBLE_QUOTE_STARTED) => {
-//                        state.emit_rest_of_line(col);
-//                        break;
-//                    }
-//                    _ => {}
-//                }
-//            }
-//            //print!("line: {}", line);
-//            print!("\n====\n");
-//            line_index += line.len();
-//        }
-//    }
-//}
-
