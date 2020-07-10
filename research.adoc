@@ -1,0 +1,20 @@
+== Unicode
+
+* https://manishearth.github.io/blog/2017/01/14/stop-ascribing-meaning-to-unicode-code-points[Let's Stop Ascribing Meaning to Code Points]
+* https://hsivonen.fi/string-length[It's not wrong that "<emoji>".length == 7]
+* https://unicode.org/reports/tr29/#Grapheme_Cluster_Boundary_Rules[Grapheme Cluster Rules]
+* https://st.suckless.org/patches/sync[On doing vsync for the terminal]
+* https://github.com/iterm2/-/wikis/syncronized-updates-spec[Terminal sync protocol and escape sequence]
+
+* https://github.com/unicode-rs/unicode-width
+* https://github.com/unicode-rs/unicode-segmentation
+* https://github.com/sbiling/rust-grapheme
+
+== Cool Reference Project
+
+ * ReVim
+ * broot
+ * Xi
+ * xi-rope
+ * ropey
+
