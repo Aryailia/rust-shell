@@ -15,6 +15,7 @@ pub struct TextGridWalk<'a> {
     char_source: std::str::Chars<'a>,
 }
 
+// @TODO fix this so it can deal with non-ascii
 impl<'a> TextGridWalk<'a> {
     pub fn new(buffer: &'a str) -> Self {
         Self {
@@ -25,28 +26,24 @@ impl<'a> TextGridWalk<'a> {
             col_index: 0,
         }
     }
-
-    /// NOTE: we do not update self.col_index
-    pub fn walk_to_line_end(&mut self) -> &str {
-        self.char_source = "".chars();
-        &self.cur_line[self.col_index..]
-    }
 }
 
 impl<'a> Iterator for TextGridWalk<'a> {
-    type Item = char;
+    type Item = (usize, usize, char);
     // NOTE: 'self.col_index' is set to +1 over returned Item
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(ch) = self.char_source.next() {
             self.col_index += 1;
-            Some(ch)
+            let index = self.row_start_index + self.col_index;
+            Some((index, self.col_index, ch))
         } else {
             let cur_line_len = self.cur_line.len();
             self.cur_line = self.line_source.next()?;
             self.char_source = self.cur_line.chars();
             self.row_start_index += cur_line_len;
             self.col_index = 0;
-            self.char_source.next()
+            let index = self.row_start_index + self.col_index;
+            self.char_source.next().map(|ch| (index, self.col_index, ch))
         }
     }
 }

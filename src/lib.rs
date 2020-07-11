@@ -7,15 +7,13 @@ use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
 use helpers::{split_inclusive, OwnedToOption, TextGridWalk};
 
-//enum Token {
-//    ident,
-//}
-
-//const FLAG_COMMENT_STARTED: u8 = 0x01;
-const UNTERMINATED: Flag = Flag(0x02);
-const DQUOTE_BEGIN: Flag = Flag(0x04);
+//const COMMENTED: Flag = Flag(0x01);
+//const WHITESPACE: Flag = Flag(0x02);
+//const SINGLE_QUOTED: Flag = Flag(0x04);
+//const DOUBLE_QUOTED: Flag = Flag(0x08);
 //const FLAG_NON_NEWLINE_WHITESPACE: u8 = 0x08;
 
+#[derive(Debug)]
 struct Flag(u8);
 use std::ops::BitOr;
 
@@ -32,38 +30,33 @@ impl Flag {
     fn set(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
-    fn unset(self, rhs: Self) -> Self {
-        Self(self.0 & !rhs.0)
+    fn unset(&mut self, rhs: Self) {
+        self.0 &= !rhs.0
     }
 }
 
 impl BitOr for Flag {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 & rhs.0)
+        Self(self.0 | rhs.0)
     }
 }
 
 use std::borrow::Cow;
 
-#[derive(Debug)]
-enum Lexeme<'a> {
-    Text(Cow<'a, str>),
-    Comment(&'a str),
-    Separator,
-    EndOfCommand,
-}
-#[derive(Debug)]
-enum Lexeme2 {
+#[derive(Debug, PartialEq)]
+enum Lexeme {
     Text(String),
     Comment(String),
+    CommentStart, // Might remove this in favour of just Comment
     Separator,
     EndOfCommand,
+    Debug(String),
 }
 
+////////////////////////////////////////////////////////////////////////////////
 struct LexerState<'a> {
     buffer: &'a str,
-    buffer_walker: TextGridWalk<'a>,
     token_start: usize,
     flags: Flag,
 }
@@ -72,7 +65,6 @@ impl<'a> LexerState<'a> {
     fn new(buffer: &'a str) -> Self {
         Self {
             buffer,
-            buffer_walker: TextGridWalk::new(buffer),
             token_start: 0,
             flags: Flag::new(),
         }
@@ -91,226 +83,147 @@ impl<'a> LexerState<'a> {
     }
 
     // Token methods
-    // 'None' means just whitespace before
-    fn exclusive_break(&mut self) -> Option<&str> {
-        let walker = &mut self.buffer_walker;
-        let start = self.token_start;
-        let index = walker.row_start_index + walker.col_index;
-        self.token_start = index + 1;
-        if start < index {
-            Some(&self.buffer[start..index])
+    fn text_till(&self, index: usize) -> Lexeme {
+        Lexeme::Text(self.buffer[self.token_start..index].into())
+    }
+}
+
+// Skip while the 'peek()' matches the predicate
+// This means that the returned value consistent with where the main loop is
+// i.e. calling 'walker.next()' again is the same as the return value + 1
+fn skip_while_peek<F>(iter: &mut Walker, start: usize, predicate: F) -> usize
+where
+    F: Fn(char) -> bool,
+{
+    let mut index = start;  // Only relevant if 'None' on peek() right off
+    loop {
+        if let Some((new_index, _, ch)) = iter.peek() {
+            index = *new_index;
+            if !predicate(*ch) {
+                break;
+            }
         } else {
-            None
+            break;
         }
+        iter.next();  // 'peek()' and 'next()' return 'None' at the same time
     }
+    index
+}
 
-    fn inclusive_break(&mut self) -> &str {
-        let walker = &mut self.buffer_walker;
-        let start_index = self.token_start;
-        let end_pos = walker.row_start_index + walker.col_index + 1;
-        //assert!(start_index < end_pos)
-        self.token_start = end_pos;
-        &self.buffer[start_index..end_pos]
-    }
+type Walker<'a> = std::iter::Peekable<TextGridWalk<'a>>;
 
-    fn rest_of_line(&mut self) -> &str {
-        let walker = &mut self.buffer_walker;
-        self.token_start += walker.cur_line.len();
-        // NOTE: 'walker.walk_to_line_end()' does not update 'walker.col_index'
-        walker.walk_to_line_end()
-    }
-
-    // Main Logic
-    //fn lex_attempt2<F: FnMut(Lexeme<'a>)>(&mut self, _ch: char, mut emit: &mut F) {
-    //    emit(Lexeme::Comment(&self.buffer[0..1]));
-    //}
-
-    fn lex_attempt1<F: Fn(Lexeme)>(&mut self, ch: char, emit: F) {
+// https://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html
+// '2.3.0' Is Token Recognition
+fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
+    let mut state = LexerState::new(body);
+    let mut walker = TextGridWalk::new(body).peekable();
+    // @TODO (_, col, _) for error handling
+    while let Some((index, _, ch)) = walker.next() {
         match ch {
-            '\\' => {
-                let walker = &mut self.buffer_walker;
-                let cur_index = walker.row_start_index + walker.col_index;
-                if let Some(x) = self.exclusive_break() {
-                    emit(Lexeme::Text(x.into()));
+            '\'' => {  // Single quote
+                if state.token_start < index { // Do not emit ''
+                    emit(state.text_till(index));
                 }
-                // POSIX does not specify what to do with dangling POSIX
-                // NOTE: Backslash before EOF is intepreted literally in
-                // dash
-                let walker = &mut self.buffer_walker;
-                let i = match walker.next() {
-                    // Index of the next character
-                    // same as 'walker.row_start_index + walker.col_index'
-                    Some(_) => self.token_start, // exclusive_break() sets
-                    // Danging backslash is returned
-                    None => cur_index,
-                };
-                self.token_start += 1; // +2 total due to 'walker.next()'
-                let escape_target = &self.buffer[i..i + 1];
-                emit(Lexeme::Text(escape_target.into()));
-            }
-
-            // @TODO: How to handle abitrary '\r' in middle of a line
-            '\n' | '\r' => {
-                if let Some(x) = self.exclusive_break() {
-                    emit(Lexeme::Text(x.into()));
-                    self.rest_of_line(); // for CRLF
-                }
-                emit(Lexeme::EndOfCommand);
-
-                // @TODO: actually benchmark this
-                // @TODO: loop over peek and delete contiguous whitespace
-                //while let Some(_) = self.buffer_walker.next() {
-                //    let peek = self.buffer_walker.peek();
-                //}
-            }
-
-            '\'' => {
-                if let Some(x) = self.exclusive_break() {
-                    emit(Lexeme::Text(x.into()));
-                }
-                let mut found = false;
-                while let Some(peek) = self.buffer_walker.next() {
-                    if peek == '\'' {
-                        if let Some(x) = self.exclusive_break() {
-                            emit(Lexeme::Text(x.into()));
-                        } else {
-                            emit(Lexeme::Text("".into()));
+                state.token_start = index + 1;  // skip opening quote
+                loop {  // Skip untill .next() is ending quote
+                    if let Some((i, _, c)) = walker.next() {
+                        if c == '\'' {
+                            emit(state.text_till(i));   // This can emit ''
+                            state.token_start = i + 1;  // skip closing quote
+                            break;
                         }
-                        found = true;
+                    } else {
+                        println!("Error, unterminated single quote");
                         break;
                     }
                 }
-                if !found {
-                    panic!("Unterminated single quote string")
+            }
+            // @TODO: double quotes
+            // @TODO: parens
+            // @TODO: curly braces
+            // @TODO: here strings
+            // @TODO: operators
+            // @TODO: $
+
+
+            '\\' => { // If end of file, just return the current backslash
+                if state.token_start < index {
+                    emit(state.text_till(index));
                 }
+                // POSIX does not specify what to do with dangling POSIX
+                // NOTE: Backslash before EOF is interpreted literally in Dash
+                let next = walker.peek().map(|(i, _, _)| *i).unwrap_or(index);
+                state.token_start = next + 1;
+                emit(Lexeme::Text(state.buffer[next..next + 1].into()));
             }
 
-            // https://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html
-            // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap07.html
-            // This should listen to LC_CTYPE, but there is a POSIX locale
-            // In POSIX local, space and tab are the only <blank>
-            ' ' | '\t' if self.is_not(DQUOTE_BEGIN) => {
-                if let Some(x) = self.exclusive_break() {
-                    emit(Lexeme::Text(x.into()));
+            // @VOLATILE: make sure this happens before handling blanks
+            // In POSIX, only newlines end commands (and ; &) see 2.9.3
+            // Carriage-return is a non-space
+            '\n' => {
+                if state.token_start < index {
+                    emit(state.text_till(index));
                 }
+                let new = skip_while_peek(&mut walker, index + 1, |c| {
+                    is_blank(c) || c == '\n'
+                });
+                state.token_start = new;
+                emit(Lexeme::EndOfCommand);
+            }
+            // @VOLATILE: make sure this happens after handling blanks
+            c if is_blank(c) => {
+                if state.token_start < index {
+                    emit(state.text_till(index));
+                }
+                let cur = skip_while_peek(&mut walker, index + 1, is_blank);
+                state.token_start = cur;
                 emit(Lexeme::Separator);
             }
-            '#' if self.is_not(DQUOTE_BEGIN) => {
-                emit(Lexeme::Comment(self.rest_of_line()));
+
+
+            // @DESIGN: Allow 'CommentStart, Text("")' to make it down the line
+            //          Might change this decision though...
+            '#' => {  // Comments
+                if state.token_start < index {
+                    emit(state.text_till(index));
+                }
+                state.token_start = index + 1;  // Skip pound
+                emit(Lexeme::CommentStart);
+                // Skip till peek() is '\n'
+                let cur = skip_while_peek(&mut walker, index + 1, |c| c != '\n');
+                emit(state.text_till(cur));  // Can emit ''
+                state.token_start = cur + 1;  // Skip newline
             }
             _ => {}
         }
     }
+}
 
-    fn exclusive(&'a mut self) -> Option<&'a str> {
-        let start = self.token_start;
-        let index = self.buffer_walker.row_start_index + self.buffer_walker.col_index;
-        self.token_start = index + 1;
-        if start < index {
-            Some(&self.buffer[start..index])
-        } else {
-            None
-        }
-    }
-
-    /***************************************************************************
-    // @IMPORTANT: This is the most working version
-    // works when '#' code is placed directly in match, but not when
-    // relegated into a function
-    // This is because self.$func_call borrows, limiting the lifetime
-    // to the match statement.
-    // This will probably cause problems down the line anyway when receveing
-    // jobs from later stages in the compile phase
-    ***************************************************************************/
-    fn lex_attempt2<F>(&mut self, ch: char, emit: &mut F)
-    where
-        F: FnMut(Lexeme<'a>),
-    {
-        match ch {
-            '#' => {
-                self.token_start += self.buffer_walker.cur_line.len();
-                self.buffer_walker.char_source = "".chars();
-
-                emit(Lexeme::Comment(
-                    &self.buffer_walker.cur_line[self.buffer_walker.col_index..],
-                ));
-                //emit(Lexeme::Comment(self.rest()));
-            }
-            //' ' | '\t' => {
-            //    if let Some(x) = a {
-            //        emit(Lexeme::Text(x.into()));
-            //    }
-            //    emit(Lexeme::Separator);
-            //}
-            _ => {}
-        }
-        //emit(Lexeme::Comment(self.buffer));
+// Test for whitespace characters
+// https://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html
+// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap07.html
+// In POSIX locale, <blank> class only includes space and tab
+//
+// This does mean that "echo\r\n" is interpreted as "echo\r"
+//
+// @TODO Should this listen to LC_CTYPE, not sure what a POSIX locale entails
+// @TODO add extra options for ignoring closing "\r"?
+fn is_blank(ch: char) -> bool {
+    match ch {
+        ' ' => true,
+        '\t' => true,
+        _ => false,
     }
 }
 
-//fn lex_attempt3<'a, F>(state: &'a mut LexerState<'a>, ch: char, emit: &mut F)
-//where
-//    F: FnMut(Lexeme<'a>),
-//{
-//    match ch {
-//        '#' => {
-//            state.token_start += state.buffer_walker.cur_line.len();
-//            state.buffer_walker.char_source = "".chars();
-//
-//            emit(Lexeme::Comment(
-//                &state.buffer_walker.cur_line[state.buffer_walker.col_index..]
-//            ));
-//            //emit(Lexeme::Comment(self.rest()));
-//        }
-//        ' ' | '\t' => {
-//            let a: Option<&'a str> = state.exclusive_break();
-//            match a {
-//                Some(x) => emit(Lexeme::<'a>::Comment(x)),
-//                None => {}
-//            }
-//            emit(Lexeme::Separator);
-//        }
-//        _ =>{}
-//    }
-//    //emit(Lexeme::Comment(state.buffer));
-//}
-//
-async fn lexer<'a, T, F>(mut stream_of_scripts: T, mut emit: F)
+async fn job_stream_lex<'a, T, F>(mut job_stream: T, mut emit: F)
 where
     T: Stream<Item = &'a str> + Unpin,
-    F: FnMut(Lexeme<'a>),
+    F: FnMut(Lexeme),
 {
-    while let Some(body) = stream_of_scripts.next().await {
+    while let Some(body) = job_stream.next().await {
         // Maybe parse shebang?
-        let mut str_lexer: LexerState<'a> = LexerState::new(body);
-        while let Some(ch) = str_lexer.buffer_walker.next() {
-            //if col == 0 {
-            //    println!("Line: {:?}", line);
-            //}
-            str_lexer.lex_attempt2(ch, &mut emit);
-            //lex_attempt3(&mut str_lexer, ch, &mut emit);
-        }
-    }
-}
-
-async fn file_stream_lex<'a, T, F>(mut stream_of_scripts: T, mut emit: F)
-where
-    T: Stream<Item = &'a str> + Unpin,
-    F: FnMut(Lexeme2),
-{
-    while let Some(body) = stream_of_scripts.next().await {
-        // Maybe parse shebang?
-        let mut str_lexer: LexerState<'a> = LexerState::new(body);
-        while let Some(ch) = str_lexer.buffer_walker.next() {
-            //if col == 0 {
-            //    println!("Line: {:?}", line);
-            //}
-            match ch {
-                '#' => emit(Lexeme2::Comment(str_lexer.buffer.into())),
-                _ => {}
-            }
-            //emit(Lexeme2::Comment(str_lexer.buffer.into()));
-        }
+        file_lex(body, &mut emit);
     }
 }
 
@@ -325,14 +238,16 @@ main() {
   printf %s\\n ${asdf}
   echo '' ''
 }
-
+#
 
 "##;
+
     fn emit1(token: Lexeme) {
         match token {
             Lexeme::EndOfCommand => println!(";"),
-            Lexeme::Comment(x) => println!("{:?}", Lexeme::Comment(x)),
+            Lexeme::Comment(x) => println!("C({:?})", x),
             Lexeme::Separator => print!("| "),
+            Lexeme::Debug(x) => print!("{}", x),
             x => print!("{:?} ", x),
         }
     }
@@ -341,44 +256,75 @@ main() {
     }
 
     #[test]
-    fn lexer_test() {
+    fn development() {
         //let (producer, consumer) = futures::channel::mpsc::unbounded::<Lexeme>();
 
+        let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
         task::block_on(async {
             println!("I am doing things\n====");
             let script_stream = stream::iter(vec![SCRIPT]);
-            let mut token_list: Vec<Lexeme2> = Vec::with_capacity(100);
 
-            //lexer(script_stream, |token| {
-            //    token_list.push(token);
-            //})
-            //.await;
-            file_stream_lex(script_stream, |token| {
+            job_stream_lex(script_stream, |token| {
                 token_list.push(token);
             })
             .await;
-            token_list
-                .into_iter()
-                .for_each(|token| println!("{:?}", token));
         });
+        token_list.into_iter().for_each(emit1);
+    }
+
+    //#[test]
+    fn lexer_test() {
+        let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
+        task::block_on(async {
+            //println!("I am doing things\n====");
+            let script_stream = stream::iter(vec![SCRIPT]);
+
+            job_stream_lex(script_stream, |token| {
+                token_list.push(token);
+            })
+            .await;
+        });
+        assert_eq!(
+            token_list,
+            vec![
+                Lexeme::CommentStart,
+                Lexeme::Text("!/bin/ashell".into()),
+                Lexeme::EndOfCommand,
+                Lexeme::Text("main()".into()),
+                Lexeme::Separator,
+                Lexeme::Text("{".into()),
+                Lexeme::EndOfCommand,
+                Lexeme::CommentStart,
+                Lexeme::Text(" yo".to_string()),
+                Lexeme::EndOfCommand,
+                Lexeme::Text("asdf=".into()),
+                Lexeme::Text("hello".into()),
+                Lexeme::EndOfCommand,
+                Lexeme::Text("printf".into()),
+                Lexeme::Separator,
+                Lexeme::Text("%s".into()),
+                Lexeme::Text("\\".into()),
+                Lexeme::Text("n".into()),
+                Lexeme::Separator,
+                Lexeme::Text("${asdf}".into()),
+                Lexeme::EndOfCommand,
+                Lexeme::Text("echo".into()),
+                Lexeme::Separator,
+                Lexeme::Text("".into()),
+                Lexeme::Separator,
+                Lexeme::Text("".into()),
+                Lexeme::EndOfCommand,
+                Lexeme::Text("}".into()),
+                Lexeme::EndOfCommand,
+                Lexeme::CommentStart,
+                Lexeme::Text("#".into()),
+                Lexeme::EndOfCommand,
+            ]
+        )
     }
 
     //#[test]
     //fn grid() {
     //    TextGridWalk::new(SCRIPT).for_each(|a| println!("{:?}", a));
-    //}
-
-    //#[test]
-    //fn hello() {
-    //    let (sender, mut receiver) = futures::channel::mpsc::unbounded::<Lexeme>();
-    //    task::block_on(async {
-    //        sender.unbounded_send(Lexeme::Text("hello".into())).unwrap();
-    //        sender.unbounded_send(Lexeme::Text("asdf".into())).unwrap();
-    //    });
-    //    task::block_on(async {
-    //        while let Some(a) = receiver.next().await {
-    //            println!("{:?}", a);
-    //        }
-    //    });
     //}
 }
