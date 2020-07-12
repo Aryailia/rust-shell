@@ -5,7 +5,7 @@ mod helpers;
 
 use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
-use helpers::{split_inclusive, OwnedToOption, TextGridWalk};
+use helpers::{OwnedToOption, TextGridWalk};
 
 //const COMMENTED: Flag = Flag(0x01);
 //const WHITESPACE: Flag = Flag(0x02);
@@ -88,54 +88,26 @@ impl<'a> LexerState<'a> {
     }
 }
 
-// Skip while the 'peek()' matches the predicate
-// This means that the returned value consistent with where the main loop is
-// i.e. calling 'walker.next()' again is the same as the return value + 1
-fn skip_while_peek<F>(iter: &mut Walker, start: usize, predicate: F) -> usize
-where
-    F: Fn(char) -> bool,
-{
-    let mut index = start;  // Only relevant if 'None' on peek() right off
-    loop {
-        if let Some((new_index, _, ch)) = iter.peek() {
-            index = *new_index;
-            if !predicate(*ch) {
-                break;
-            }
-        } else {
-            break;
-        }
-        iter.next();  // 'peek()' and 'next()' return 'None' at the same time
-    }
-    index
-}
-
 type Walker<'a> = std::iter::Peekable<TextGridWalk<'a>>;
 
 // https://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html
 // '2.3.0' Is Token Recognition
 fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
     let mut state = LexerState::new(body);
-    let mut walker = TextGridWalk::new(body).peekable();
-    // @TODO (_, col, _) for error handling
-    while let Some((index, _, ch)) = walker.next() {
+    let mut walker = TextGridWalk::new(body);
+    // @TODO (_, _, tuple) for error handling
+    while let Some((index, ch, _)) = walker.next() {
         match ch {
             '\'' => {  // Single quote
                 if state.token_start < index { // Do not emit ''
                     emit(state.text_till(index));
                 }
                 state.token_start = index + 1;  // skip opening quote
-                loop {  // Skip untill .next() is ending quote
-                    if let Some((i, _, c)) = walker.next() {
-                        if c == '\'' {
-                            emit(state.text_till(i));   // This can emit ''
-                            state.token_start = i + 1;  // skip closing quote
-                            break;
-                        }
-                    } else {
-                        println!("Error, unterminated single quote");
-                        break;
-                    }
+                if let Some(index) = walker.next_while(|c| c == '\'') {
+                    emit(state.text_till(index));   // This can emit ''
+                    state.token_start = index + 1;  // skip closing quote
+                } else {
+                    println!("Error, unterminated single quote");
                 }
             }
             // @TODO: double quotes
@@ -152,7 +124,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 }
                 // POSIX does not specify what to do with dangling POSIX
                 // NOTE: Backslash before EOF is interpreted literally in Dash
-                let next = walker.peek().map(|(i, _, _)| *i).unwrap_or(index);
+                let next = walker.peek().map(|(i, _, _)| i).unwrap_or(index);
                 state.token_start = next + 1;
                 emit(Lexeme::Text(state.buffer[next..next + 1].into()));
             }
@@ -164,10 +136,10 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 if state.token_start < index {
                     emit(state.text_till(index));
                 }
-                let new = skip_while_peek(&mut walker, index + 1, |c| {
+                let after_last_semantic_space = walker.peek_till(|c| {
                     is_blank(c) || c == '\n'
-                });
-                state.token_start = new;
+                }).unwrap_or(index + 1);
+                state.token_start = after_last_semantic_space;
                 emit(Lexeme::EndOfCommand);
             }
             // @VOLATILE: make sure this happens after handling blanks
@@ -175,7 +147,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 if state.token_start < index {
                     emit(state.text_till(index));
                 }
-                let cur = skip_while_peek(&mut walker, index + 1, is_blank);
+                let cur = walker.peek_till(is_blank).unwrap_or(index + 1);
                 state.token_start = cur;
                 emit(Lexeme::Separator);
             }
@@ -190,7 +162,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 state.token_start = index + 1;  // Skip pound
                 emit(Lexeme::CommentStart);
                 // Skip till peek() is '\n'
-                let cur = skip_while_peek(&mut walker, index + 1, |c| c != '\n');
+                let cur = walker.peek_till(|c| c != '\n').unwrap_or(index + 1);
                 emit(state.text_till(cur));  // Can emit ''
                 state.token_start = cur + 1;  // Skip newline
             }
@@ -272,7 +244,7 @@ main() {
         token_list.into_iter().for_each(emit1);
     }
 
-    //#[test]
+    #[test]
     fn lexer_test() {
         let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
         task::block_on(async {
@@ -317,7 +289,7 @@ main() {
                 Lexeme::Text("}".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::CommentStart,
-                Lexeme::Text("#".into()),
+                Lexeme::Text("".into()),
                 Lexeme::EndOfCommand,
             ]
         )
