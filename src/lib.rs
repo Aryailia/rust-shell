@@ -11,8 +11,13 @@ use helpers::{OwnedToOption, TextGridWalk};
 const HERE_DOCUMENT_OPEN: Flag = Flag(0x01);
 const HERE_DOCUMENT_BODY: Flag = Flag(0x02);
 const STRIP_TABS_FOR_HERE_DOCUMENT: Flag = Flag(0x4);
-const DOUBLE_QUOTED: Flag = Flag(0x08);
+//const DOUBLE_QUOTED: Flag = Flag(0x08);
 const BACKTICKED: Flag = Flag(0x16);
+
+
+// @VOLATILE: Depends solely on 'LexerState::emit_text_delim()'
+const BLANKABLE: bool = true;
+const NON_BLANK: bool = false;
 
 #[derive(Debug)]
 struct Flag(u8);
@@ -21,9 +26,6 @@ use std::ops::BitOr;
 impl Flag {
     fn new() -> Self {
         Flag(0)
-    }
-    fn reset(&mut self) {
-        *self = Self::new()
     }
     fn is(&self, rhs: Self) -> bool {
         self.0 & rhs.0 != 0
@@ -46,10 +48,35 @@ impl BitOr for Flag {
     }
 }
 
+
+struct NestLevelQueue<T> {
+    index: usize,
+    list: Vec<T>,
+}
+impl<T> NestLevelQueue<T> {
+    fn first(&self) -> &T {
+        &self.list[self.index]
+    }
+    fn pop_front(&mut self) -> &T {
+        let i = self.index;
+        self.index += 1;
+        &self.list[i]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.index + 1 > self.list.len()
+    }
+
+    fn push(&mut self, value: T) {
+        self.list.push(value);
+    }
+}
+
+
 // @TODO change to Cow<str> or &str if possible for later stages
 #[derive(Debug, PartialEq)]
 enum Lexeme {
-    Text(String), // Refers to 'words' as in "2. Shell Command Language"
+    Word(String), // Refers to 'words' as in "2. Shell Command Language"
     Comment(String),
     CommentStart, // Might remove this in favour of just Comment
     Separator,
@@ -74,9 +101,9 @@ struct LexerState<'a> {
     token_start: usize,
     flags: Flag,
     emitter: &'a mut dyn FnMut(Lexeme),
-    here_doc_closers: Vec<String>,
-    here_closer: String,
-    here_doc_cursor: usize,
+    heredoc_delim_list: NestLevelQueue<String>,
+    heredoc_delim_buffer: String,
+    quote_state: QuoteType,
 }
 
 // @TODO benchmark skipping whitespace
@@ -88,37 +115,70 @@ impl<'a> LexerState<'a> {
             token_start: 0,
             flags: Flag::new(),
             emitter,
-            here_doc_closers: Vec::new(),
-            here_closer: "\n".to_string(),
-            here_doc_cursor: 0,
+            heredoc_delim_list: NestLevelQueue {
+                index: 0,
+                list: Vec::new(),
+            },
+            heredoc_delim_buffer: String::new(),
+            quote_state: UNQUOTED,
         }
     }
 
-    fn finish_here_closer(&mut self) {
+    fn finish_here_delim(&mut self) {
         self.flags.unset(HERE_DOCUMENT_OPEN);
-        let closer = std::mem::take(&mut self.here_closer);
-        self.here_closer.push('\n');
-        self.here_doc_closers.push(closer);
+        let delim = std::mem::take(&mut self.heredoc_delim_buffer);
+        self.heredoc_delim_buffer.push('\n');
+        self.heredoc_delim_list.push(delim);
     }
-    fn push_here_closer(&mut self, index: usize) {
+    fn push_here_delim(&mut self, index: usize) {
         let hunk = &self.buffer[self.token_start..index];
-        self.here_closer.push_str(hunk);
+        self.heredoc_delim_buffer.push_str(hunk);
     }
 
     fn text_till(&self, index: usize) -> String {
         self.buffer[self.token_start..index].to_string()
     }
 
-    fn emit_text_till(&mut self, index: usize) {
-        let token = Lexeme::Text(self.text_till(index));
-        (self.emitter)(token);
-    }
-
     fn emit(&mut self, token: Lexeme) {
         (self.emitter)(token);
     }
 
-    //#[cfg(debug)]
+    // Used after every character that is a non-word
+    //
+    // Here document delimiter recognition functions differently
+    // than the rest of the code
+    //fn emit_nonblank_word_or_end_heredoc_delim(&mut self, index: usize) {
+    fn emit_non_word_delim(&mut self, index: usize) {
+        if self.flags.is(HERE_DOCUMENT_OPEN) {
+            self.push_here_delim(index);
+
+            let delim = std::mem::take(&mut self.heredoc_delim_buffer);
+            self.flags.unset(HERE_DOCUMENT_OPEN);
+            self.heredoc_delim_list.push(delim);
+        } else if self.token_start < index {
+            let token = Lexeme::Word(self.text_till(index));
+            (self.emitter)(token);
+        }
+    }
+
+    // This can build up heredocs
+    fn emit_quoted(&mut self, quote_type: QuoteType, index: usize) {
+        if self.flags.is(HERE_DOCUMENT_OPEN) {
+            self.push_here_delim(index);
+        } else {
+            let can_blank = self.quote_state == quote_type;
+            self.emit_word_delim(index, can_blank);
+        }
+    }
+
+    fn emit_word_delim(&mut self, index: usize, can_be_empty: bool) {
+        if can_be_empty || self.token_start < index {
+            let token = self.buffer[self.token_start .. index].to_string();
+            (self.emitter)(Lexeme::Word(token));
+        }
+    }
+
+    #[cfg(debug_assertions)]
     fn print_context(&self, mut byte_index: usize) {
         // Get the char at the byte index 'index'
         let ch = self.buffer[byte_index..].chars().next().unwrap();
@@ -135,14 +195,8 @@ impl<'a> LexerState<'a> {
             &padded[byte_index + ch_len..byte_index + ch_len + end],
         );
     }
-
-    //    fn cursor_over_span(delimiter: char, buffer: &str) ->  {
-    //        if let Some(index) = walker.next_till(|c| c == '') {
-    //            emit(state.text_till(index));   // This can emit ''
-    //            state.token_start = index + 1;  // skip closing quote
-    //        }
-    //    }
 }
+
 
 //struct Cursor {
 //    index: usize,
@@ -171,6 +225,26 @@ impl<'a> LexerState<'a> {
 // @TEST \<EOF>
 // @TEST <<EOF1 <<EOF2 cat // See example 2.7.4
 
+
+// @TODO Cannot figure out a way to do this in a higher-level way
+// 'struct QuoteType(u8)' fails when doing 'match' in the patterns
+// '#[repr(u8)] enum QuoteType' means 'From<u8>' (or 'BitXor') are not free
+type QuoteType = u8;
+const UNQUOTED: QuoteType = 0;
+const HERE_DOC: QuoteType = 1;
+const SINGLE_QUOTED: QuoteType = '\'' as u8;
+const DOUBLE_QUOTED: QuoteType = '"' as u8;
+
+trait ToggleExt<T: std::ops::BitXor> {
+    fn toggle(&mut self, rhs: T);
+}
+
+impl ToggleExt<QuoteType> for QuoteType {
+    fn toggle(&mut self, rhs: QuoteType) {
+        *self ^= rhs;
+    }
+}
+
 // https://pubs.opengroup.org/onlinepubs/009695399/utilities/xcu_chap02.html
 // '2.3.0' Is Token Recognition
 fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
@@ -185,17 +259,30 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
         //    }
         //}
 
-        if state.flags.is(DOUBLE_QUOTED) {
-            match ch {
-                // See "2.2.3 Double-Quotes"
-                //'\'' if state.flags.is(SINGLE_QUOTED) => {}
-                '$' | '`' | '\\' | '"' => {}
-                _ => continue,
-            }
-        } else if state.flags.is(HERE_DOCUMENT_BODY) {
-            let closer = state.here_doc_closers[state.here_doc_cursor].as_str();
-            if line == closer {
-                state.here_doc_cursor += 1;  // unshift 'here_doc_closers'
+        //println!("{:?}", (UNQUOTED.0, 'a'));
+        // Handle skipping due to quoting
+        match (state.quote_state, ch) {
+            (UNQUOTED, _) => {}
+
+            (SINGLE_QUOTED, '\'') => {}
+
+            (DOUBLE_QUOTED, '$') => {}
+            (DOUBLE_QUOTED, '`') => {}
+            (DOUBLE_QUOTED, '\\') => {}
+            (DOUBLE_QUOTED, '"') => {}
+
+            (HERE_DOC, '`') => {}
+            (HERE_DOC, '$') => {}
+            (HERE_DOC, '\\') => {}
+
+            _ => continue,
+        }
+
+        if state.flags.is(HERE_DOCUMENT_BODY) {
+
+            let delim = state.heredoc_delim_list.first().as_str();
+            if &line[1..] == delim {
+                state.heredoc_delim_list.pop_front();
                 state.flags.unset(HERE_DOCUMENT_BODY);
                 let line_end = index + line.len();
 
@@ -219,75 +306,56 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // @TODO: Remove newline (2.2.1 Escape Character)
             '\\' => {
                 // If end of file, just return the current backslash
-                if state.token_start < index {
-                    state.emit_text_till(index);
-                }
+                state.emit_word_delim(index, BLANKABLE);
+                let next = walker.peek().map(|(_, i, _, _)| i);
                 // POSIX does not specify what to do with dangling POSIX
                 // NOTE: Backslash before EOF is interpreted literally in Dash
-                let next = walker.peek().map(|(_, i, _, _)| i).unwrap_or(index);
+                let next = next.unwrap_or(index);
 
                 // Emit literal character without backslash (unless EOF)
                 walker.next();
                 state.token_start = next + 1;
                 let escaped = state.buffer[next..next + 1].into();
-                state.emit(Lexeme::Text(escaped));
-                print!("Hello: {:?} ", state.flags);
-                state.print_context(next + 1);
+                state.emit(Lexeme::Word(escaped));
+            }
+
+            // Quotes
+            //'\'' => {
+            //    // Single quote
+            //    state.emit_word_delim(index, NON_BLANK);
+            //    state.token_start = index + 1; // skip opening quote
+            //    if let Some(index) = walker.next_till(|c| c == '\'') {
+            //        state.emit_word_delim(index, NON_BLANK);
+            //        state.token_start = index + 1; // skip closing quote
+            //    } else {
+            //        panic!("Unterminated single quote");
+            //    }
+            //}
+
+            // @TODO benchmark combine quotes 
+            '"' | '\'' => {
+                state.emit_quoted(ch as QuoteType, index);
+                state.quote_state.toggle(ch as QuoteType);
+                state.token_start = index + 1; // Skip quote
             }
 
             // @TODO multiple here documents
             '<' => {
-                if state.flags.is(HERE_DOCUMENT_OPEN) {
-                    state.push_here_closer(index);
-                    state.finish_here_closer();
-                } else if state.token_start < index {
-                    state.emit_text_till(index);
-                }
+                state.emit_non_word_delim(index);
 
                 // If the peek is '<'
                 // @TODO <<-
                 if walker.peek().iter().any(|(_, _, c, _)| *c == '<') {
                     state.flags.set(HERE_DOCUMENT_OPEN);
                     walker.next();
-                    let cur = walker.peek_while(is_blank).unwrap_or(index + 2);
-                    state.token_start = cur;
+                    let cur = walker.peek_while(is_blank);
+                    state.token_start = cur.unwrap_or(index + 2);  // skip '<<'
                 } else {
                     state.emit(Lexeme::OpInputRedirect);
                     state.token_start = index + 1;
                 }
             }
 
-            '"' => {
-                if state.flags.is(HERE_DOCUMENT_OPEN) {
-                    state.push_here_closer(index);
-                } else if state.flags.is_not(DOUBLE_QUOTED) {
-                    state.flags.set(DOUBLE_QUOTED);
-                    if state.token_start < index {
-                        state.emit_text_till(index); // Skip ''
-                    }
-                } else {
-                    state.flags.unset(DOUBLE_QUOTED);
-                    state.emit_text_till(index); // Allow emit ''
-                }
-                state.token_start = index + 1; // Skip quote
-            }
-
-            '\'' => {
-                // Single quote
-                if state.token_start < index {
-                    // Do not emit ''
-                    state.emit_text_till(index);
-                }
-                state.token_start = index + 1; // skip opening quote
-                if let Some(index) = walker.next_till(|c| c == '\'') {
-                    state.emit_text_till(index); // This can emit ''
-                    state.token_start = index + 1; // skip closing quote
-                } else {
-                    panic!("Unterminated single quote");
-                }
-            }
-
-            // @TODO: double quotes
             // @TODO: parens
             // @TODO: curly braces
             // @TODO: here strings
@@ -298,65 +366,57 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // In POSIX, only newlines end commands (and ; &) see 2.9.3
             // Carriage-return is a non-space
             '\n' => {
-                if state.token_start < index {
-                    state.emit_text_till(index);
-                }
+                state.emit_non_word_delim(index);
 
-                if state.here_doc_cursor + 1 >= state.here_doc_closers.len() {
-                    // @TODO benchmark this
-                    // Skis contiguous whitespace
-                    let after_last_semantic_space = walker
-                        .peek_while(|c| is_blank(c) || c == '\n')
-                        .unwrap_or(index + 1);
-                    state.token_start = after_last_semantic_space;
-                } else {
+                if !state.heredoc_delim_list.is_empty() {
                     if state.flags.is(HERE_DOCUMENT_OPEN) {
                         panic!("Here-document delimiter not specified");
                     } else {
                         state.flags.set(HERE_DOCUMENT_BODY);
                         state.token_start = index + 1; // after newline
                     }
+                } else {
+                    // @TODO benchmark this
+                    // Skis contiguous whitespace
+                    let after_last_semantic_space = walker
+                        .peek_while(|c| is_blank(c) || c == '\n')
+                        .unwrap_or(index + 1);
+                    state.token_start = after_last_semantic_space;
                 }
 
                 state.emit(Lexeme::EndOfCommand);
             }
             // @VOLATILE: make sure this happens after handling blanks
-            c if is_blank(c) => {
-                if state.flags.is(HERE_DOCUMENT_OPEN) {
-                    state.push_here_closer(index);
-                    state.finish_here_closer();
-                } else if state.token_start < index {
-                    state.emit_text_till(index);
-                }
+            _ if is_blank(ch) => {
+                state.emit_non_word_delim(index);
                 let cur = walker.peek_while(is_blank).unwrap_or(index + 1);
                 state.token_start = cur;
                 state.emit(Lexeme::Separator);
             }
 
             ';' => {
+                state.emit_non_word_delim(index);
                 state.emit(Lexeme::EndOfCommand);
                 state.token_start = index + 1;
             }
 
-            // @DESIGN: Allow 'CommentStart, Text("")' to make it down the line
+            // @DESIGN: Allow 'CommentStart, Word("")' to make it down the line
             //          Might change this decision though...
             '#' => {
                 // Comments
-                if state.flags.is(HERE_DOCUMENT_OPEN) {
-                    state.push_here_closer(index);
-                    state.finish_here_closer();
-                } else if state.token_start < index {
-                    state.emit_text_till(index);
-                }
+                state.emit_non_word_delim(index);
                 state.token_start = index + 1; // Skip pound
                 state.emit(Lexeme::CommentStart);
                 // Skip till peek() is '\n'
                 let cur = walker.peek_while(|c| c != '\n').unwrap_or(index + 1);
-                state.emit_text_till(cur); // Can emit ''
+                state.emit_word_delim(cur, BLANKABLE);
                 state.token_start = cur + 1; // Skip newline
             }
             _ => {}
         }
+
+
+        // @TODO if check if quote level is not UNQUOTED
     }
 }
 
@@ -392,6 +452,28 @@ where
 mod parser_tests {
     use super::*;
 
+    #[test]
+    fn transmute_toggle() {
+        #[repr(u8)]
+        enum Quote {
+
+            Unquoted = 0,
+            Heredoc = 1,
+            Single = '\'' as u8,
+            Double = '"' as u8,
+        }
+
+        let input = '\'' as u8;
+        let quote_enum = unsafe { std::mem::transmute::<u8, Quote>(input) };
+        match quote_enum {
+            Quote::Unquoted => println!("Quote"),
+            Quote::Heredoc => println!("Heredoc"),
+            Quote::Single => println!("Single"),
+            Quote::Double => println!("Double"),
+        }
+    }
+
+
     const SCRIPT: &str = r##"#!/bin/ashell
 main() {
   # yo
@@ -405,6 +487,7 @@ main() {
     const SCRIPT2: &str = r##"
 <<     "H"ello cat -
     amazing
+    ${hello}
 Hello
   printf %s\\n hello
   yo
@@ -440,11 +523,10 @@ Hello
         token_list.into_iter().for_each(emit1);
     }
 
-    //#[test]
+    #[test]
     fn lexer_test() {
         let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
         task::block_on(async {
-            //println!("I am doing things\n====");
             let script_stream = stream::iter(vec![SCRIPT]);
 
             job_stream_lex(script_stream, |token| {
@@ -456,36 +538,36 @@ Hello
             token_list,
             vec![
                 Lexeme::CommentStart,
-                Lexeme::Text("!/bin/ashell".into()),
+                Lexeme::Word("!/bin/ashell".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Text("main()".into()),
+                Lexeme::Word("main()".into()),
                 Lexeme::Separator,
-                Lexeme::Text("{".into()),
+                Lexeme::Word("{".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::CommentStart,
-                Lexeme::Text(" yo".to_string()),
+                Lexeme::Word(" yo".to_string()),
                 Lexeme::EndOfCommand,
-                Lexeme::Text("asdf=".into()),
-                Lexeme::Text("hello".into()),
+                Lexeme::Word("asdf=".into()),
+                Lexeme::Word("hello".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Text("printf".into()),
+                Lexeme::Word("printf".into()),
                 Lexeme::Separator,
-                Lexeme::Text("%s".into()),
-                Lexeme::Text("\\".into()),
-                Lexeme::Text("n".into()),
+                Lexeme::Word("%s".into()),
+                Lexeme::Word("\\".into()),
+                Lexeme::Word("n".into()),
                 Lexeme::Separator,
-                Lexeme::Text("${asdf}".into()),
+                Lexeme::Word("${asdf}".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Text("echo".into()),
+                Lexeme::Word("echo".into()),
                 Lexeme::Separator,
-                Lexeme::Text("".into()),
+                Lexeme::Word("".into()),
                 Lexeme::Separator,
-                Lexeme::Text("".into()),
+                Lexeme::Word("".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Text("}".into()),
+                Lexeme::Word("}".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::CommentStart,
-                Lexeme::Text("".into()),
+                Lexeme::Word("".into()),
                 Lexeme::EndOfCommand,
             ]
         )
