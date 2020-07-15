@@ -167,11 +167,11 @@ impl<'a> LexerState<'a> {
             self.push_here_delim(index);
         } else {
             let can_blank = self.quote_state == quote_type;
-            self.emit_word_delim(index, can_blank);
+            self.emit_word(index, can_blank);
         }
     }
 
-    fn emit_word_delim(&mut self, index: usize, can_be_empty: bool) {
+    fn emit_word(&mut self, index: usize, can_be_empty: bool) {
         if can_be_empty || self.token_start < index {
             let token = self.buffer[self.token_start .. index].to_string();
             (self.emitter)(Lexeme::Word(token));
@@ -251,7 +251,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
     let mut state = LexerState::new(body, emit);
     let mut walker = TextGridWalk::new(body);
     // @TODO (_, _, tuple) for error handling
-    while let Some((line, index, ch, _)) = walker.next() {
+    while let Some((unprocessed, index, ch, _)) = walker.next() {
         //println!("char {:?}", ch);
         //if let QuoteType::None = state.quote_type {
         //    match state.quote_type {
@@ -281,10 +281,10 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
         if state.flags.is(HERE_DOCUMENT_BODY) {
 
             let delim = state.heredoc_delim_list.first().as_str();
-            if &line[1..] == delim {
+            if unprocessed == delim {
                 state.heredoc_delim_list.pop_front();
                 state.flags.unset(HERE_DOCUMENT_BODY);
-                let line_end = index + line.len();
+                let line_end = index + unprocessed.len();
 
                 walker.next();
                 walker.peek_while(|c| c != '\n');
@@ -306,7 +306,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // @TODO: Remove newline (2.2.1 Escape Character)
             '\\' => {
                 // If end of file, just return the current backslash
-                state.emit_word_delim(index, BLANKABLE);
+                state.emit_word(index, BLANKABLE);
                 let next = walker.peek().map(|(_, i, _, _)| i);
                 // POSIX does not specify what to do with dangling POSIX
                 // NOTE: Backslash before EOF is interpreted literally in Dash
@@ -322,10 +322,10 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // Quotes
             //'\'' => {
             //    // Single quote
-            //    state.emit_word_delim(index, NON_BLANK);
+            //    state.emit_word(index, NON_BLANK);
             //    state.token_start = index + 1; // skip opening quote
             //    if let Some(index) = walker.next_till(|c| c == '\'') {
-            //        state.emit_word_delim(index, NON_BLANK);
+            //        state.emit_word(index, NON_BLANK);
             //        state.token_start = index + 1; // skip closing quote
             //    } else {
             //        panic!("Unterminated single quote");
@@ -409,7 +409,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 state.emit(Lexeme::CommentStart);
                 // Skip till peek() is '\n'
                 let cur = walker.peek_while(|c| c != '\n').unwrap_or(index + 1);
-                state.emit_word_delim(cur, BLANKABLE);
+                state.emit_word(cur, BLANKABLE);
                 state.token_start = cur + 1; // Skip newline
             }
             _ => {}

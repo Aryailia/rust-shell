@@ -1,38 +1,70 @@
 //run: cargo test -- --nocapture
 
 pub struct TextGridWalk<'a> {
-//pub struct TextGridWalk<'a> {
+    //pub struct TextGridWalk<'a> {
     peek: Option<GridItem<'a>>,
 
-    cur_line: &'a str,
+    unprocessed_line: &'a str,
+    line_end: usize,
     row: usize,
     col: usize,
     index: usize,
-    line_source: SplitInclusive<'a>,
     char_source: std::str::Chars<'a>,
 }
 
-//type GridItem<'a> = (usize, char, (&'a str, usize, usize));
 type GridItem<'a> = (&'a str, usize, char, (usize, usize));
+
+// Basically a wrapper around buffer.chars() but adds extra info like row/col
 impl<'a> TextGridWalk<'a> {
     pub fn new(buffer: &'a str) -> Self {
         let mut char_source = buffer.chars();
-        let mut line_source = split_before_newlines(buffer);
-        let cur_line = line_source.next().unwrap_or("");
-        let col = 1;
-        let row = 1;
-        Self {
-            peek: char_source.next().map(|ch| (cur_line, 0, ch, (row, col))),
+        let line_end = buffer.find('\n').unwrap_or(buffer.len());
+        let unprocessed_line = &buffer[0..line_end];
+        let col = 0;
+        let row = 0;
 
-            cur_line,
+        Self {
+            peek: char_source
+                .next()
+                .map(|ch| (unprocessed_line, 0, ch, (row, col))),
+
+            unprocessed_line,
+            line_end,
             row,
             col,
             index: 0,
-            line_source,
             char_source,
         }
     }
+}
 
+impl<'a> Iterator for TextGridWalk<'a> {
+    type Item = GridItem<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.peek.map(|(unprocessed_line, cur_index, cur_ch, cur_info)| {
+            let rest = self.char_source.as_str(); // includes 'cur_ch'
+            let char_len = cur_ch.len_utf8();
+
+            self.index += char_len;
+            self.peek = self.char_source.next().map(|ch| {
+                if cur_ch == '\n' {
+                    self.line_end = rest.find('\n').unwrap_or(rest.len());
+                    self.row += 1;
+                    self.col = 0;
+                } else {
+                    self.line_end -= char_len;
+                    self.col += 1;
+                }
+                self.unprocessed_line = &rest[0..self.line_end];
+                (self.unprocessed_line, self.index, ch, (self.row, self.col))
+            });
+
+            (unprocessed_line, cur_index, cur_ch, cur_info)
+        })
+    }
+}
+
+impl<'a> TextGridWalk<'a> {
     /// Peek is not lazy like std::iter::peekable().peek()
     /// The first peek is evaluated eagerly on 'new()'
     pub fn peek(&self) -> Option<<Self as Iterator>::Item> {
@@ -43,7 +75,7 @@ impl<'a> TextGridWalk<'a> {
     /// the iterator
     pub fn peek_while<F>(&mut self, predicate: F) -> Option<usize>
     where
-        F: Fn(char) -> bool
+        F: Fn(char) -> bool,
     {
         loop {
             if let Some((_, index, c, _)) = self.peek {
@@ -53,13 +85,13 @@ impl<'a> TextGridWalk<'a> {
             } else {
                 break None;
             }
-            self.next();  // 'peek()' and 'next()' are 'None' at the same time
+            self.next(); // 'peek()' and 'next()' are 'None' at the same time
         }
     }
 
     pub fn next_till<F>(&mut self, predicate: F) -> Option<usize>
     where
-        F: Fn(char) -> bool
+        F: Fn(char) -> bool,
     {
         loop {
             if let Some((_, index, c, _)) = self.next() {
@@ -73,29 +105,8 @@ impl<'a> TextGridWalk<'a> {
     }
 }
 
-impl<'a> Iterator for TextGridWalk<'a> {
-    type Item = GridItem<'a>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.peek.map(|cur| {
-            self.peek = self.char_source.next().map(|ch| {
-                self.index += cur.2.len_utf8();
-                if ch == '\n' {
-                    self.cur_line = self.line_source.next().unwrap_or("");
-                    self.row += 1;
-                    self.col = 0;
-                } else {
-                    self.col += 1;
-                }
-                //(self.index, ch, (self.cur_line, self.row, self.col))
-                (self.cur_line, self.index, ch, (self.row, self.col))
-            });
-            cur
-        })
-    }
-}
-
 #[test]
-fn grid_walk_test() {
+fn grid_walk_hits_unicode_boundaries() {
     let buffer = "你好號碼hello\ndarkness別忘了我my ol\nd朋友a阿a";
     let walker1 = buffer.chars();
     let mut walker2 = TextGridWalk::new(buffer);
@@ -112,12 +123,10 @@ fn grid_walk_test() {
 //pub struct SplitInclusive<'a, F>(&'a str, F);
 pub struct SplitInclusive<'a>(&'a str, &'a dyn Fn(&'a str) -> Option<usize>);
 
-
 //impl<'a, F> Iterator for SplitInclusive<'a, F>
 //where
-    //F: Fn(&'a str) -> Option<usize>,
-impl<'a> Iterator for SplitInclusive<'a>
-{
+//F: Fn(&'a str) -> Option<usize>,
+impl<'a> Iterator for SplitInclusive<'a> {
     type Item = &'a str;
     fn next(&mut self) -> Option<Self::Item> {
         let Self(rest, pattern) = self;
@@ -141,26 +150,29 @@ pub fn hello() {
     let text = "你好號碼hello\ndarkness\nd朋友a阿a";
     SplitInclusive(text, &|rest: &str| {
         let mut as_chars = rest.chars();
-        as_chars.next().and_then(|ch| {
-            as_chars.as_str().find('\n').map(|i| ch.len_utf8() + i)
-        })
+        as_chars
+            .next()
+            .and_then(|ch| as_chars.as_str().find('\n').map(|i| ch.len_utf8() + i))
     })
     .for_each(|line| println!("|{:?}|", line));
 }
 
-pub fn split_before_newlines<'a>(buffer: &'a str) -> SplitInclusive<'a> {
-    SplitInclusive(buffer, &|rest: &str| {
-        let mut as_chars = rest.chars();
-        as_chars.next().and_then(|ch| {
-            as_chars.as_str().find('\n').map(|i| ch.len_utf8() + i)
-        })
-    })
-}
+// This is actually implemented incorrectly, particularly if the first line
+// is blank, this should return a blank
+//fn find_next_prepended_line(rest: &str) -> Option<usize>{
+//    let mut as_chars = rest.chars();
+//    as_chars.next().and_then(|ch| {
+//        as_chars.as_str().find('\n').map(|i| ch.len_utf8() + i)
+//    })
+//}
+//
+//pub fn split_before_newlines<'a>(buffer: &'a str) -> SplitInclusive<'a> {
+//    SplitInclusive(buffer, &find_next_prepended_line)
+//}
 
 fn split_after_newlines<'a>(buffer: &'a str) -> impl Iterator<Item = &'a str> {
     SplitInclusive(buffer, &|rest: &'a str| rest.find('\n').map(|i| i + 1))
 }
-
 
 #[test]
 fn splitting_inclusively() {
@@ -171,20 +183,9 @@ fn splitting_inclusively() {
     assert_eq!(Some("\n"), lines.next());
     assert_eq!(Some("baz\n"), lines.next());
     assert_eq!(None, lines.next());
-    let mut lines = split_before_newlines(text);
-    assert_eq!(Some("foo\r"), lines.next());
-    assert_eq!(Some("\nbar"), lines.next());
-    assert_eq!(Some("\n"), lines.next());
-    assert_eq!(Some("\nbaz"), lines.next());
-    assert_eq!(Some("\n"), lines.next());
-    assert_eq!(None, lines.next());
 
     let text = "\n\n";
     let mut lines = split_after_newlines(text);
-    assert_eq!(Some("\n"), lines.next());
-    assert_eq!(Some("\n"), lines.next());
-    assert_eq!(None, lines.next());
-    let mut lines = split_before_newlines(text);
     assert_eq!(Some("\n"), lines.next());
     assert_eq!(Some("\n"), lines.next());
     assert_eq!(None, lines.next());
@@ -193,21 +194,13 @@ fn splitting_inclusively() {
     let mut lines = split_after_newlines(text);
     assert_eq!(Some("\n"), lines.next());
     assert_eq!(None, lines.next());
-    let mut lines = split_before_newlines(text);
-    assert_eq!(Some("\n"), lines.next());
-    assert_eq!(None, lines.next());
 
     let text = "";
     let mut lines = split_after_newlines(text);
     assert_eq!(None, lines.next());
-    let mut lines = split_before_newlines(text);
-    assert_eq!(None, lines.next());
 
     let text = "hello";
     let mut lines = split_after_newlines(text);
-    assert_eq!(Some("hello"), lines.next());
-    assert_eq!(None, lines.next());
-    let mut lines = split_before_newlines(text);
     assert_eq!(Some("hello"), lines.next());
     assert_eq!(None, lines.next());
 
@@ -216,16 +209,12 @@ fn splitting_inclusively() {
     assert_eq!(Some("hello\n"), lines.next());
     assert_eq!(Some("darkness"), lines.next());
     assert_eq!(None, lines.next());
-    let mut lines = split_before_newlines(text);
-    assert_eq!(Some("hello"), lines.next());
-    assert_eq!(Some("\ndarkness"), lines.next());
-    assert_eq!(None, lines.next());
 
     let text = "你好號碼hello\ndarkness別忘了我my ol\nd朋友a阿a";
-    let mut lines = split_before_newlines(text);
-    assert_eq!(Some("你好號碼hello"), lines.next());
-    assert_eq!(Some("\ndarkness別忘了我my ol"), lines.next());
-    assert_eq!(Some("\nd朋友a阿a"), lines.next());
+    let mut lines = split_after_newlines(text);
+    assert_eq!(Some("你好號碼hello\n"), lines.next());
+    assert_eq!(Some("darkness別忘了我my ol\n"), lines.next());
+    assert_eq!(Some("d朋友a阿a"), lines.next());
     assert_eq!(None, lines.next());
 }
 
