@@ -8,18 +8,17 @@ use futures::{stream, stream::Stream, StreamExt};
 use helpers::{OwnedToOption, TextGridWalk};
 
 //const COMMENTED: Flag = Flag(0x01);
-const HERE_DOCUMENT_OPEN: Flag = Flag(0x01);
-const HERE_DOCUMENT_BODY: Flag = Flag(0x02);
-const STRIP_TABS_FOR_HERE_DOCUMENT: Flag = Flag(0x4);
-//const DOUBLE_QUOTED: Flag = Flag(0x08);
-const BACKTICKED: Flag = Flag(0x16);
-
+const NO_FLAGS: Flag = Flag(0x00);
+const BUILD_DELIM: Flag = Flag(0x01);
+const BUILD_DELIM_TAB: Flag = Flag(0x02);
+const HERE_DOCUMENT_STRIP_TABS: Flag = Flag(0x4);
+const BACKTICKED: Flag = Flag(0x08);
 
 // @VOLATILE: Depends solely on 'LexerState::emit_text_delim()'
 const BLANKABLE: bool = true;
 const NON_BLANK: bool = false;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Flag(u8);
 use std::ops::BitOr;
 
@@ -48,7 +47,6 @@ impl BitOr for Flag {
     }
 }
 
-
 struct NestLevelQueue<T> {
     index: usize,
     list: Vec<T>,
@@ -72,7 +70,6 @@ impl<T> NestLevelQueue<T> {
     }
 }
 
-
 // @TODO change to Cow<str> or &str if possible for later stages
 #[derive(Debug, PartialEq)]
 enum Lexeme {
@@ -86,7 +83,10 @@ enum Lexeme {
     SameEnvCommand(String),
 
     // List of Operators
-    HereDocument(String),
+    HereDoc(String),
+    HereDocBegin,
+    HereDocEnd,
+    OpInputHereDoc,
     OpInputRedirect,
     OpOutputRedirect,
     OpErrorRedirect,
@@ -101,7 +101,7 @@ struct LexerState<'a> {
     token_start: usize,
     flags: Flag,
     emitter: &'a mut dyn FnMut(Lexeme),
-    heredoc_delim_list: NestLevelQueue<String>,
+    heredoc_delim_list: NestLevelQueue<(String, Flag)>,
     heredoc_delim_buffer: String,
     quote_state: QuoteType,
 }
@@ -124,21 +124,16 @@ impl<'a> LexerState<'a> {
         }
     }
 
-    fn finish_here_delim(&mut self) {
-        self.flags.unset(HERE_DOCUMENT_OPEN);
-        let delim = std::mem::take(&mut self.heredoc_delim_buffer);
-        self.heredoc_delim_buffer.push('\n');
-        self.heredoc_delim_list.push(delim);
-    }
-    fn push_here_delim(&mut self, index: usize) {
+    fn push_heredoc_delim(&mut self, index: usize) {
         let hunk = &self.buffer[self.token_start..index];
         self.heredoc_delim_buffer.push_str(hunk);
     }
 
-    fn text_till(&self, index: usize) -> String {
-        self.buffer[self.token_start..index].to_string()
+    fn text_till(&self, index: usize) -> &str {
+        &self.buffer[self.token_start..index]
     }
 
+    // @HereDocStep 2.2
     fn emit(&mut self, token: Lexeme) {
         (self.emitter)(token);
     }
@@ -148,23 +143,31 @@ impl<'a> LexerState<'a> {
     // Here document delimiter recognition functions differently
     // than the rest of the code
     //fn emit_nonblank_word_or_end_heredoc_delim(&mut self, index: usize) {
+    // @HereDocStep 2.3
     fn emit_non_word_delim(&mut self, index: usize) {
-        if self.flags.is(HERE_DOCUMENT_OPEN) {
-            self.push_here_delim(index);
+        if self.flags.is(BUILD_DELIM | BUILD_DELIM_TAB) {
+            self.push_heredoc_delim(index);
 
             let delim = std::mem::take(&mut self.heredoc_delim_buffer);
-            self.flags.unset(HERE_DOCUMENT_OPEN);
-            self.heredoc_delim_list.push(delim);
+            let delay_set_flag = if self.flags.is(BUILD_DELIM_TAB) {
+                HERE_DOCUMENT_STRIP_TABS
+            } else  {
+                NO_FLAGS
+            };
+
+            self.flags.unset(BUILD_DELIM | BUILD_DELIM_TAB);
+            self.heredoc_delim_list.push((delim, delay_set_flag));
         } else if self.token_start < index {
-            let token = Lexeme::Word(self.text_till(index));
+            let token = Lexeme::Word(self.text_till(index).to_string());
             (self.emitter)(token);
         }
     }
 
     // This can build up heredocs
+    // @HereDocStep 2.2
     fn emit_quoted(&mut self, quote_type: QuoteType, index: usize) {
-        if self.flags.is(HERE_DOCUMENT_OPEN) {
-            self.push_here_delim(index);
+        if self.flags.is(BUILD_DELIM | BUILD_DELIM_TAB) {
+            self.push_heredoc_delim(index);
         } else {
             let can_blank = self.quote_state == quote_type;
             self.emit_word(index, can_blank);
@@ -173,7 +176,7 @@ impl<'a> LexerState<'a> {
 
     fn emit_word(&mut self, index: usize, can_be_empty: bool) {
         if can_be_empty || self.token_start < index {
-            let token = self.buffer[self.token_start .. index].to_string();
+            let token = self.buffer[self.token_start..index].to_string();
             (self.emitter)(Lexeme::Word(token));
         }
     }
@@ -196,7 +199,6 @@ impl<'a> LexerState<'a> {
         );
     }
 }
-
 
 //struct Cursor {
 //    index: usize,
@@ -225,13 +227,12 @@ impl<'a> LexerState<'a> {
 // @TEST \<EOF>
 // @TEST <<EOF1 <<EOF2 cat // See example 2.7.4
 
-
 // @TODO Cannot figure out a way to do this in a higher-level way
 // 'struct QuoteType(u8)' fails when doing 'match' in the patterns
 // '#[repr(u8)] enum QuoteType' means 'From<u8>' (or 'BitXor') are not free
 type QuoteType = u8;
 const UNQUOTED: QuoteType = 0;
-const HERE_DOC: QuoteType = 1;
+const HERE_DOCUMENT: QuoteType = 1;
 const SINGLE_QUOTED: QuoteType = '\'' as u8;
 const DOUBLE_QUOTED: QuoteType = '"' as u8;
 
@@ -251,7 +252,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
     let mut state = LexerState::new(body, emit);
     let mut walker = TextGridWalk::new(body);
     // @TODO (_, _, tuple) for error handling
-    while let Some((unprocessed, index, ch, _)) = walker.next() {
+    while let Some((remaining_line, index, ch, _)) = walker.next() {
         //println!("char {:?}", ch);
         //if let QuoteType::None = state.quote_type {
         //    match state.quote_type {
@@ -259,45 +260,46 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
         //    }
         //}
 
-        //println!("{:?}", (UNQUOTED.0, 'a'));
         // Handle skipping due to quoting
-        match (state.quote_state, ch) {
-            (UNQUOTED, _) => {}
+        match (state.quote_state, ch, walker.peek().map(|(_, _, c, _)| c)) {
+            (UNQUOTED, _, _) => {}
 
-            (SINGLE_QUOTED, '\'') => {}
+            (SINGLE_QUOTED, '\'', _) => {}
 
-            (DOUBLE_QUOTED, '$') => {}
-            (DOUBLE_QUOTED, '`') => {}
-            (DOUBLE_QUOTED, '\\') => {}
-            (DOUBLE_QUOTED, '"') => {}
+            (DOUBLE_QUOTED, '$', _) => {}
+            (DOUBLE_QUOTED, '`', _) => {}
+            (DOUBLE_QUOTED, '\\', _) => {}
+            (DOUBLE_QUOTED, '"', _) => {}
 
-            (HERE_DOC, '`') => {}
-            (HERE_DOC, '$') => {}
-            (HERE_DOC, '\\') => {}
-
-            _ => continue,
-        }
-
-        if state.flags.is(HERE_DOCUMENT_BODY) {
-
-            let delim = state.heredoc_delim_list.first().as_str();
-            if unprocessed == delim {
+            // Finish the here document
+            // @HereDocStep 5, final
+            (HERE_DOCUMENT, _, _) if remaining_line == state.heredoc_delim_list.first().0.as_str() => {
                 state.heredoc_delim_list.pop_front();
-                state.flags.unset(HERE_DOCUMENT_BODY);
-                let line_end = index + unprocessed.len();
+                state.flags.unset(HERE_DOCUMENT_STRIP_TABS);
+                state.quote_state = UNQUOTED;
+                let line_end = index + remaining_line.len();
 
                 walker.next();
                 walker.peek_while(|c| c != '\n');
-                // Emit up till before newline before current 'line'
-                state.emit(Lexeme::HereDocument(state.text_till(index)));
+                // @TODO replace with word when we no longer to debug this
+                state.emit(Lexeme::HereDoc(state.text_till(index).into()));
+                state.emit(Lexeme::HereDocEnd);
                 state.token_start = line_end; // before newline after 'line'
-                continue  // start newline processing
-            } else {
-                match ch {
-                    '$' | '`' | '\\' => {}
-                    _ => continue,
-                }
+                continue; // start newline processing
             }
+            // @HereDocStep 4.1
+            (HERE_DOCUMENT, '`', _) => {}
+            (HERE_DOCUMENT, '$', _) => {}
+            (HERE_DOCUMENT, '\\', _) => {}
+            // @HereDocStep 4.2
+            (HERE_DOCUMENT, '\n', Some('\t')) if state.flags.is(HERE_DOCUMENT_STRIP_TABS) => {
+                // @TODO replace with word when we no longer to debug this
+                state.emit(Lexeme::HereDoc(state.text_till(index + 1).into()));
+                state.token_start = index + 2;
+                continue
+            }
+
+            _ => continue,
         }
 
         // Special case stuff
@@ -332,8 +334,9 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             //    }
             //}
 
-            // @TODO benchmark combine quotes 
+            // @TODO benchmark combine quotes
             '"' | '\'' => {
+                // These quotes interact with here document delim uniquely
                 state.emit_quoted(ch as QuoteType, index);
                 state.quote_state.toggle(ch as QuoteType);
                 state.token_start = index + 1; // Skip quote
@@ -343,17 +346,49 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             '<' => {
                 state.emit_non_word_delim(index);
 
-                // If the peek is '<'
-                // @TODO <<-
-                if walker.peek().iter().any(|(_, _, c, _)| *c == '<') {
-                    state.flags.set(HERE_DOCUMENT_OPEN);
-                    walker.next();
-                    let cur = walker.peek_while(is_blank);
-                    state.token_start = cur.unwrap_or(index + 2);  // skip '<<'
-                } else {
-                    state.emit(Lexeme::OpInputRedirect);
-                    state.token_start = index + 1;
+                match (remaining_line.get(1..2), remaining_line.get(2..3)) {
+                    (Some("<"), Some("-")) => {
+                        // "<<-"
+                        // @TODO <<-
+                        state.flags.set(BUILD_DELIM_TAB);
+                        walker.next();
+                        walker.next();
+                        let cur = walker.peek_while(is_blank);
+                        state.token_start = cur.unwrap_or(index + 3);
+                        state.emit(Lexeme::OpInputHereDoc);
+                    }
+                    (Some("<"), _) => {
+                        // "<<"
+                        state.flags.set(BUILD_DELIM);
+                        walker.next();
+                        let cur = walker.peek_while(is_blank);
+                        state.token_start = cur.unwrap_or(index + 2);
+                        state.emit(Lexeme::OpInputHereDoc);
+                    }
+                    _ => {
+                        state.token_start = index + 1;
+                        state.emit(Lexeme::OpInputRedirect);
+                    }
                 }
+            }
+
+            '$' => {
+                //state.emit_non_word_delim(index);
+                //match (remaining_line.get(1 .. 2), remaining_line.get(2 .. 3)) {
+                //    (Some("("), Some("(")) => {
+                //        state.token_start = index + 3;
+                //    }
+                //    (Some("("), _) => {
+                //        state.token_start = index + 2;
+                //    }
+                //    (Some("{"), _) => {
+                //    //    state.token_start = index + 2;
+                //    }
+                //    _ => { // Let cursor use as word (plaintext)
+                //    //    state.emit(Lexeme::Word("$".into()));
+                //    //    state.token_start = index + 1;
+                //    }
+                //}
             }
 
             // @TODO: parens
@@ -365,15 +400,22 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // @VOLATILE: make sure this happens before handling blanks
             // In POSIX, only newlines end commands (and ; &) see 2.9.3
             // Carriage-return is a non-space
+            // @HereDocStep 3
             '\n' => {
                 state.emit_non_word_delim(index);
 
+                // If a delim was pushed, initialise here document procesing
                 if !state.heredoc_delim_list.is_empty() {
-                    if state.flags.is(HERE_DOCUMENT_OPEN) {
+                    // If the delim was never finished by newline, error
+                    if state.flags.is(BUILD_DELIM | BUILD_DELIM_TAB) {
                         panic!("Here-document delimiter not specified");
                     } else {
-                        state.flags.set(HERE_DOCUMENT_BODY);
+                        let delay_set_flag = state.heredoc_delim_list.first().1;
+                        state.flags.set(delay_set_flag);
+                        state.quote_state = HERE_DOCUMENT;
                         state.token_start = index + 1; // after newline
+                        state.emit(Lexeme::EndOfCommand);
+                        state.emit(Lexeme::HereDocBegin);
                     }
                 } else {
                     // @TODO benchmark this
@@ -382,9 +424,9 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                         .peek_while(|c| is_blank(c) || c == '\n')
                         .unwrap_or(index + 1);
                     state.token_start = after_last_semantic_space;
+                    state.emit(Lexeme::EndOfCommand);
                 }
 
-                state.emit(Lexeme::EndOfCommand);
             }
             // @VOLATILE: make sure this happens after handling blanks
             _ if is_blank(ch) => {
@@ -414,7 +456,6 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             }
             _ => {}
         }
-
 
         // @TODO if check if quote level is not UNQUOTED
     }
@@ -456,7 +497,6 @@ mod parser_tests {
     fn transmute_toggle() {
         #[repr(u8)]
         enum Quote {
-
             Unquoted = 0,
             Heredoc = 1,
             Single = '\'' as u8,
@@ -473,7 +513,6 @@ mod parser_tests {
         }
     }
 
-
     const SCRIPT: &str = r##"#!/bin/ashell
 main() {
   # yo
@@ -485,9 +524,9 @@ main() {
 
 "##;
     const SCRIPT2: &str = r##"
-<<     "H"ello cat -
+<<-     "H"ello cat -
     amazing
-    ${hello}
+	${hello}
 Hello
   printf %s\\n hello
   yo
