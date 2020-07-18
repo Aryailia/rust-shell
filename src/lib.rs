@@ -73,7 +73,7 @@ impl<T> NestLevelQueue<T> {
 // @TODO change to Cow<str> or &str if possible for later stages
 #[derive(Debug, PartialEq)]
 enum Lexeme {
-    Word(String), // Refers to 'words' as in "2. Shell Command Language"
+    Word(String), // 'Words' as defined in "2. Shell Command Language"
     Comment(String),
     CommentStart, // Might remove this in favour of just Comment
     Separator,
@@ -81,6 +81,10 @@ enum Lexeme {
     Unprocessed(String),
     NewEnvCommand(String),
     SameEnvCommand(String),
+
+
+    //
+    Variable(String),
 
     // List of Operators
     HereDoc(String),
@@ -105,8 +109,6 @@ struct LexerState<'a> {
     heredoc_delim_buffer: String,
     quote_state: QuoteType,
 }
-
-// @TODO benchmark skipping whitespace
 
 impl<'a> LexerState<'a> {
     fn new(buffer: &'a str, emitter: &'a mut dyn FnMut(Lexeme)) -> Self {
@@ -133,16 +135,26 @@ impl<'a> LexerState<'a> {
         &self.buffer[self.token_start..index]
     }
 
+    ////////////////////////////////////////////////////////////////////////////
+    // Emiting functions
+    ////////////////////////////////////////////////////////////////////////////
+    // There are three different types of emits we can that have side-effects
+    // on two different axes:
+    // - whether to 1) pushes to the here document delimiter buffer, 2) push
+    //   to and delimit the buffer, 3) do not interact with the buffer
+    // - whether to emit the default Lexeme::Word(self.token_start .. index)
+    //   or to emit something custom
+
+
+    // Do not interact with buffer, emit custom
     // @HereDocStep 2.2
     fn emit(&mut self, token: Lexeme) {
         (self.emitter)(token);
     }
 
+    // Push to and delimit here-doc, emit default word lexeme
     // Used after every character that is a non-word
     //
-    // Here document delimiter recognition functions differently
-    // than the rest of the code
-    //fn emit_nonblank_word_or_end_heredoc_delim(&mut self, index: usize) {
     // @HereDocStep 2.3
     fn emit_non_word_delim(&mut self, index: usize) {
         if self.flags.is(BUILD_DELIM | BUILD_DELIM_TAB) {
@@ -163,8 +175,8 @@ impl<'a> LexerState<'a> {
         }
     }
 
-    // This can build up heredocs
-    // @HereDocStep 2.2
+    // Push to here-doc without delimiting, emit default word lexeme
+    // @HereDocStep 2.1
     fn emit_quoted(&mut self, quote_type: QuoteType, index: usize) {
         if self.flags.is(BUILD_DELIM | BUILD_DELIM_TAB) {
             self.push_heredoc_delim(index);
@@ -174,6 +186,7 @@ impl<'a> LexerState<'a> {
         }
     }
 
+    // Do not interact with here-doc delim buffer, emit default word lexeme
     fn emit_word(&mut self, index: usize, can_be_empty: bool) {
         if can_be_empty || self.token_start < index {
             let token = self.buffer[self.token_start..index].to_string();
@@ -200,6 +213,8 @@ impl<'a> LexerState<'a> {
     }
 }
 
+//// @TODO Thinking about this if I want to pass in ranges to the emit functions
+//
 //struct Cursor {
 //    index: usize,
 //}
@@ -252,13 +267,11 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
     let mut state = LexerState::new(body, emit);
     let mut walker = TextGridWalk::new(body);
     // @TODO (_, _, tuple) for error handling
+
+    // 'state.buffer[token_start..index]' defines the token we are currently
+    // building up, by default this is considered a word
+    // walker.next() is essentianlly incrementing  a token_end
     while let Some((remaining_line, index, ch, _)) = walker.next() {
-        //println!("char {:?}", ch);
-        //if let QuoteType::None = state.quote_type {
-        //    match state.quote_type {
-        //        '\'' =>
-        //    }
-        //}
 
         // Handle skipping due to quoting
         match (state.quote_state, ch, walker.peek().map(|(_, _, c, _)| c)) {
@@ -281,7 +294,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
 
                 walker.next();
                 walker.peek_while(|c| c != '\n');
-                // @TODO replace with word when we no longer to debug this
+                // @TODO replace with 'emit_word()' when we no longer to debug this
                 state.emit(Lexeme::HereDoc(state.text_till(index).into()));
                 state.emit(Lexeme::HereDocEnd);
                 state.token_start = line_end; // before newline after 'line'
@@ -292,17 +305,18 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             (HERE_DOCUMENT, '$', _) => {}
             (HERE_DOCUMENT, '\\', _) => {}
             // @HereDocStep 4.2
+            // If strip_tabs then strip, else skip over newlines
             (HERE_DOCUMENT, '\n', Some('\t')) if state.flags.is(HERE_DOCUMENT_STRIP_TABS) => {
-                // @TODO replace with word when we no longer to debug this
+                // @TODO replace with 'emit_word()' when we no longer to debug this
                 state.emit(Lexeme::HereDoc(state.text_till(index + 1).into()));
                 state.token_start = index + 2;
                 continue
             }
 
+            // No special handling for other characters because quoted
             _ => continue,
         }
 
-        // Special case stuff
         match ch {
             // Backslash gets highest priority
             // @TODO: Remove newline (2.2.1 Escape Character)
@@ -372,24 +386,33 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 }
             }
 
-            '$' => {
-                //state.emit_non_word_delim(index);
-                //match (remaining_line.get(1 .. 2), remaining_line.get(2 .. 3)) {
-                //    (Some("("), Some("(")) => {
-                //        state.token_start = index + 3;
-                //    }
-                //    (Some("("), _) => {
-                //        state.token_start = index + 2;
-                //    }
-                //    (Some("{"), _) => {
-                //    //    state.token_start = index + 2;
-                //    }
-                //    _ => { // Let cursor use as word (plaintext)
-                //    //    state.emit(Lexeme::Word("$".into()));
-                //    //    state.token_start = index + 1;
-                //    }
-                //}
-            }
+            //'$' => {
+            //    state.emit_non_word_delim(index);
+            //    match (remaining_line.get(1 .. 2), remaining_line.get(2 .. 3)) {
+            //        (Some("("), Some("(")) => {
+            //            state.token_start = index + 3;
+            //        }
+            //        (Some("("), _) => {
+            //            state.token_start = index + 2;
+            //        }
+            //        (Some("{"), _) => {
+            //            state.token_start = index + 2;
+            //            let cur = walker.peek_while(|c|
+            //                c != '}' && c != '#' && c != '%'
+            //            );
+            //            state.emit(Lexeme::VarLookup(state.text_till(cur).into());
+            //            
+            //        }
+
+            //        (Some(ch2), _) => {
+            //        }
+
+            //        _ => { // Let cursor use as word (plaintext)
+            //        //    state.emit(Lexeme::Word("$".into()));
+            //        //    state.token_start = index + 1;
+            //        }
+            //    }
+            //}
 
             // @TODO: parens
             // @TODO: curly braces
@@ -397,10 +420,18 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // @TODO: operators
             // @TODO: $
 
-            // @VOLATILE: make sure this happens before handling blanks
+            ';' => {
+                state.emit_non_word_delim(index);
+                state.emit(Lexeme::EndOfCommand);
+                state.token_start = index + 1;
+            }
+
+            // @HereDocStep 3
+            // @VOLATILE: make sure this happens before handling blanks in
+            //            case 'is_blank' also returns true for newlines
+            //
             // In POSIX, only newlines end commands (and ; &) see 2.9.3
             // Carriage-return is a non-space
-            // @HereDocStep 3
             '\n' => {
                 state.emit_non_word_delim(index);
 
@@ -418,7 +449,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                         state.emit(Lexeme::HereDocBegin);
                     }
                 } else {
-                    // @TODO benchmark this
+                    // @TODO benchmark skipping whitespace
                     // Skis contiguous whitespace
                     let after_last_semantic_space = walker
                         .peek_while(|c| is_blank(c) || c == '\n')
@@ -428,33 +459,27 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 }
 
             }
-            // @VOLATILE: make sure this happens after handling blanks
+            // @VOLATILE: make sure this happens after handling newlines in
+            //            case 'is_blank' also returns true for newlines
             _ if is_blank(ch) => {
                 state.emit_non_word_delim(index);
+                // @TODO benchmark skipping whitespace
                 let cur = walker.peek_while(is_blank).unwrap_or(index + 1);
                 state.token_start = cur;
                 state.emit(Lexeme::Separator);
             }
 
-            ';' => {
-                state.emit_non_word_delim(index);
-                state.emit(Lexeme::EndOfCommand);
-                state.token_start = index + 1;
-            }
-
-            // @DESIGN: Allow 'CommentStart, Word("")' to make it down the line
-            //          Might change this decision though...
             '#' => {
                 // Comments
                 state.emit_non_word_delim(index);
                 state.token_start = index + 1; // Skip pound
-                state.emit(Lexeme::CommentStart);
                 // Skip till peek() is '\n'
                 let cur = walker.peek_while(|c| c != '\n').unwrap_or(index + 1);
-                state.emit_word(cur, BLANKABLE);
+                state.emit(Lexeme::Comment(state.text_till(cur).to_string()));
                 state.token_start = cur + 1; // Skip newline
             }
-            _ => {}
+
+            _ => {}  // Allow it to perform 'walker.next()' in peace
         }
 
         // @TODO if check if quote level is not UNQUOTED
@@ -524,12 +549,14 @@ main() {
 
 "##;
     const SCRIPT2: &str = r##"
-<<-     "H"ello cat -
+<<-     "H"ello cat -; <<EOF cat -
     amazing
 	${hello}
 Hello
   printf %s\\n hello
   yo
+EOF
+echo hello
 "##;
 
     fn emit1(token: Lexeme) {
@@ -576,15 +603,13 @@ Hello
         assert_eq!(
             token_list,
             vec![
-                Lexeme::CommentStart,
-                Lexeme::Word("!/bin/ashell".into()),
+                Lexeme::Comment("!/bin/ashell".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::Word("main()".into()),
                 Lexeme::Separator,
                 Lexeme::Word("{".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::CommentStart,
-                Lexeme::Word(" yo".to_string()),
+                Lexeme::Comment(" yo".to_string()),
                 Lexeme::EndOfCommand,
                 Lexeme::Word("asdf=".into()),
                 Lexeme::Word("hello".into()),
@@ -605,8 +630,7 @@ Hello
                 Lexeme::EndOfCommand,
                 Lexeme::Word("}".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::CommentStart,
-                Lexeme::Word("".into()),
+                Lexeme::Comment("".into()),
                 Lexeme::EndOfCommand,
             ]
         )
