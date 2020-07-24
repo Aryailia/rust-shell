@@ -8,19 +8,20 @@ mod helpers;
 use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
 use helpers::{OwnedToOption, TextGridWalk};
+use std::collections::VecDeque;
+use std::mem::discriminant;
 use std::ops::Range;
 
 const NO_FLAGS: Flag = Flag(0x00);
-const HAS_QUOTE: Flag = Flag(0x01); // Allows a blank word lexemes
-const BUILD_DELIM: Flag = Flag(0x02);
-const BUILD_DELIM_TAB: Flag = Flag(0x04);
-const HERE_DOCUMENT: Flag = Flag(0x8);
+//const COMMAND_FIRST_TOKEN = Flag(0x01);
+const HAS_SINGLE_OR_DOUBLE_QUOTE: Flag = Flag(0x02); // Allows a blank word lexemes
+const BUILD_DELIM: Flag = Flag(0x04);
+const BUILD_DELIM_TAB: Flag = Flag(0x08);
 const STRIP_TABS: Flag = Flag(0x10);
 const BACKTICKED: Flag = Flag(0x20);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct Flag(u8);
-use std::ops::BitOr;
 
 impl Flag {
     fn new() -> Self {
@@ -40,36 +41,34 @@ impl Flag {
     }
 }
 
-impl BitOr for Flag {
+impl std::ops::BitOr for Flag {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
 }
 
-struct NestLevelQueue<T> {
-    index: usize,
-    list: Vec<T>,
+#[derive(Debug)]
+enum ExpandableQuote {
+    Unquoted,
+    Double,
+    HereDoc,
 }
-impl<T> NestLevelQueue<T> {
-    fn pop_front(&mut self) -> &T {
-        let i = self.index;
-        self.index += 1;
-        &self.list[i]
-    }
-
-    fn current_value(&self) -> &T {
-        &self.list[self.index]
-    }
-
-    fn is_empty(&self) -> bool {
-        self.index + 1 > self.list.len()
-    }
-
-    fn push(&mut self, value: T) {
-        self.list.push(value);
+impl PartialEq for ExpandableQuote {
+    fn eq(&self, rhs: &Self) -> bool {
+        discriminant(self) == discriminant(rhs)
     }
 }
+
+#[derive(Clone, Debug)]
+#[repr(u8)]
+enum Nestable {
+    Backtick = 0,
+    Arithmetic = 1,
+    Parenthesis = 2,
+    Curly = 3,
+}
+const NEST_TOTAL_SIZE: usize = 4; // @VOLATILE: size of 'Nestable'
 
 // @TODO change to Cow<str> or &str if possible for later stages
 #[derive(Debug, PartialEq)]
@@ -107,7 +106,7 @@ enum Lexeme {
     Debug(String),
 }
 
-type HereDocDelimList = NestLevelQueue<(String, bool)>;
+type HereDocDelimList = VecDeque<(String, bool)>;
 
 // Need one per file source processed
 // In charge of
@@ -116,10 +115,11 @@ struct LexemeBuilder<'a> {
     flags: Flag,
     emitter: &'a mut dyn FnMut(Lexeme),
     buffer: String,
-    is_first_token: bool,
+    output_index: usize,
     quote_state: ExpandableQuote,
     nesting_stack: Vec<(ExpandableQuote, Nestable, Info)>,
     nesting_depth: [usize; NEST_TOTAL_SIZE],
+    heredoc_delim_list: HereDocDelimList,
 }
 
 // For keeping mutability of .'buffer' and use of 'emitter' to local methods
@@ -130,10 +130,11 @@ impl<'a> LexemeBuilder<'a> {
             flags: Flag::new(),
             emitter,
             buffer: String::new(),
-            is_first_token: true,
+            output_index: 0,
             quote_state: ExpandableQuote::Unquoted,
             nesting_stack: Vec::new(),
             nesting_depth: [0; NEST_TOTAL_SIZE],
+            heredoc_delim_list: HereDocDelimList::new(),
         }
     }
 
@@ -153,20 +154,23 @@ impl<'a> LexemeBuilder<'a> {
     }
 
     // Plex
-    fn lexeme_delimit(&mut self, delim_list: &mut HereDocDelimList) {
+    fn lexeme_delimit(&mut self) {
         // Strip leading blanks
         // @HEREDOC Step 2
+        let has_quote = self.flags.is(HAS_SINGLE_OR_DOUBLE_QUOTE);
         if self.flags.is(BUILD_DELIM | BUILD_DELIM_TAB) {
-            let delim = self.buffer.clone();
-            delim_list.push((delim, self.flags.is(BUILD_DELIM_TAB)));
+            let entry = (self.buffer.clone(), self.flags.is(BUILD_DELIM_TAB));
+            self.heredoc_delim_list.push_back(entry);
             self.buffer.clear();
-            self.is_first_token = false;
+            self.output_index += 1;
             self.flags.unset(BUILD_DELIM | BUILD_DELIM_TAB);
-        } else if self.flags.is(HAS_QUOTE) || !self.buffer.is_empty() {
+        } else if has_quote || !self.buffer.is_empty() {
+            // @POSIX 2.10.2 (Step 1) Shell Grammar Rules
+            // @TODO: Reserved words cannot have quotes
             (self.emitter)(Lexeme::Word(self.buffer.clone()));
             self.buffer.clear();
-            self.flags.unset(HAS_QUOTE);
-            self.is_first_token = false;
+            self.flags.unset(HAS_SINGLE_OR_DOUBLE_QUOTE);
+            self.output_index += 1;
         }
     }
 
@@ -198,7 +202,7 @@ impl<'a> LexemeBuilder<'a> {
             nest_type.clone(),
             val,
         ));
-        self.is_first_token = true;
+        self.output_index = 0;
         self.nesting_depth[nest_type as usize] += 1;
     }
 
@@ -262,24 +266,23 @@ impl Cursor {
 // Random helper methods
 impl<'a> LexemeBuilder<'a> {
     // @VOLATILE: Coordinate with ending heredoc branch of '\n'
-    //            Does not seem like heredoc needs ot set 'is_first_token'
+    //            Does not seem like heredoc needs ot set '.output_index'
     fn end_command_and_walk_to_next_token(
         &mut self,
         walker: &mut TextGridWalk,
         cursor: &mut Cursor,
-        delim_list: &mut HereDocDelimList,
         index: usize,
         ch: char,
         token: Lexeme,
     ) {
         self.lexeme_append(cursor.move_to(index));
-        self.lexeme_delimit(delim_list);
+        self.lexeme_delimit();
 
         // Skip if current line is a blank line
-        if !self.is_first_token {
+        if self.output_index > 0 {
             self.emit(token);
         }
-        self.is_first_token = true;
+        self.output_index = 0;
 
         // Skip until the next non-blank, non-newline character
         let non_blank = walker.peek_while(|c| is_blank(c) || c == '\n');
@@ -291,17 +294,15 @@ impl<'a> LexemeBuilder<'a> {
         &mut self,
         walker: &mut TextGridWalk,
         cursor: &mut Cursor,
-        heredoc_nesting: &mut HereDocDelimList,
         index: usize,
     ) {
         // Start a new here-document
         if let ExpandableQuote::Unquoted = self.quote_state {
             let till_now = cursor.move_to(index);
             self.lexeme_append(till_now);
-            self.lexeme_delimit(heredoc_nesting);
+            self.lexeme_delimit();
 
             // @VOLATILE: Coordinate with 'end_command_and_walk_to_non_next()'
-            //let (delim, flag) = heredoc_nesting.pop_front();
             self.emit(Lexeme::EndOfCommand);
             self.emit(Lexeme::HereDocStart);
             self.quote_state = ExpandableQuote::HereDoc;
@@ -314,11 +315,11 @@ impl<'a> LexemeBuilder<'a> {
 
         // Decide to strip the tab or close the here-document
         if let Some((line, after_newline, peek_c, _)) = walker.peek() {
-            let (delim, is_strip) = heredoc_nesting.current_value();
+            let (delim, is_strip) = self.heredoc_delim_list.front().unwrap();
             let delim_len = delim.len();
             if line == delim.as_str() {
                 self.lexeme_append(cursor.move_to(after_newline));
-                self.lexeme_delimit(heredoc_nesting);
+                self.lexeme_delimit();
                 self.emit(Lexeme::HereDocClose);
 
                 let after_closer = walker
@@ -329,7 +330,7 @@ impl<'a> LexemeBuilder<'a> {
                 cursor.move_to(after_closer);
 
                 self.quote_state = ExpandableQuote::Unquoted;
-                heredoc_nesting.pop_front();
+                self.heredoc_delim_list.pop_front();
             } else if *is_strip && peek_c == '\t' {
                 self.lexeme_append(cursor.move_to(after_newline));
                 cursor.move_to(after_newline + '\t'.len_utf8());
@@ -340,31 +341,11 @@ impl<'a> LexemeBuilder<'a> {
     }
 }
 
-// const SKIP_TABS: bool = true;
-const ALLOW_TABS: bool = false;
+// @TODO: Skip command expansion for heredoc delim
 const SKIP_COMMAND_EXPANSION: bool = true;
 
-#[derive(Debug, PartialEq)]
-enum ExpandableQuote {
-    Unquoted,
-    Double,
-    HereDoc,
-}
-
-#[derive(Clone, Debug)]
-#[repr(u8)]
-enum Nestable {
-    Backtick = 0,
-    Arithmetic = 1,
-    Parenthesis = 2,
-    Curly = 3,
-}
-const NEST_TOTAL_SIZE: usize = 4;
-
-use std::mem::discriminant;
 
 type Info = (usize, usize);
-
 impl<'a> TextGridWalk<'a> {
     // @TODO: double check if this starter_index is necessary or if we can
     //        just use a value within self
@@ -380,15 +361,6 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
     let mut state = LexemeBuilder::new(body, emit);
     let mut walker = TextGridWalk::new(body);
     let mut cursor = Cursor { index: 0 };
-
-    // @TODO consider moving back into 'LexemeBuilder' on quote rewrite
-    // Not in state so we can control borrow checker
-    let mut heredoc_nesting = HereDocDelimList {
-        index: 0,
-        list: Vec::new(),
-    };
-
-    // @TODO (_, _, tuple) for error handling
 
     // 'state.buffer[token_start..index]' defines the token we are currently
     // building up, by default this is considered a word
@@ -441,20 +413,19 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                                 // Remove the backslashes
                                 state.buffer.truncate(len - num_of_backslash);
                                 //println!("start '{}' - {} {}", state.buffer, len, num_of_backslash);
-                                state.lexeme_delimit(&mut heredoc_nesting);
+                                state.lexeme_delimit();
                                 state.emit(Lexeme::SubShellStart);
                                 state.start_a_nesting(info, Nestable::Backtick);
                             } else if count + 1 == tick_nest_depth {
                                 // Remove the backslashes
                                 state.buffer.truncate(len - num_of_backslash);
                                 //println!("close {:?} - {} {}", state.buffer, len, num_of_backslash);
-                                state.lexeme_delimit(&mut heredoc_nesting);
+                                state.lexeme_delimit();
                                 state.emit(Lexeme::SubShellClose);
                                 state.close_a_nesting(Nestable::Backtick).unwrap();
                             } else {
                                 panic!("mismatched backticks");
                             }
-
 
                             peek_i + '`'.len_utf8()
                         }
@@ -511,7 +482,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // @BACKTICK Step 1
             '`' => {
                 state.lexeme_append(cursor.move_to(index));
-                state.lexeme_delimit(&mut heredoc_nesting);
+                state.lexeme_delimit();
 
                 if state.depth_of(Nestable::Backtick) == 0 {
                     state.start_a_nesting(info, Nestable::Backtick);
@@ -524,9 +495,10 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 cursor.move_to(index + '`'.len_utf8());
             }
 
+            // @POSIX
             '$' => {
                 state.lexeme_append(cursor.move_to(index));
-                state.lexeme_delimit(&mut heredoc_nesting);
+                state.lexeme_delimit();
 
                 match (rest_of_line.chars().nth(1), rest_of_line.chars().nth(2)) {
                     (Some('('), Some('(')) => {
@@ -539,7 +511,8 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                         state.emit(Lexeme::SubShellStart);
                         cursor.move_to(index + "$(".len());
                     }
-                    _ => {}
+                    //(Some('{'), _)
+                    _ => {} // Plaintext
                 }
             }
 
@@ -550,11 +523,10 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             // In POSIX, only newlines end commands (and ; &) see 2.9.3
             // Carriage-return is a non-space
             '\n' => {
-                if heredoc_nesting.is_empty() {
+                if state.heredoc_delim_list.is_empty() {
                     state.end_command_and_walk_to_next_token(
                         &mut walker,
                         &mut cursor,
-                        &mut heredoc_nesting,
                         index,
                         ch,
                         Lexeme::EndOfCommand,
@@ -569,12 +541,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 // set the 'state.quote_state'
                 // @HEREDOC Step 3.2
                 } else {
-                    state.heredoc_maybe_end_or_strip_tab(
-                        &mut walker,
-                        &mut cursor,
-                        &mut heredoc_nesting,
-                        index,
-                    );
+                    state.heredoc_maybe_end_or_strip_tab(&mut walker, &mut cursor, index);
                 }
             }
 
@@ -583,7 +550,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
 
             // Escaping is different within quotes/here-documents
             '"' => {
-                state.flags.set(HAS_QUOTE);
+                state.flags.set(HAS_SINGLE_OR_DOUBLE_QUOTE);
                 state.lexeme_append(cursor.move_to(index));
                 state.quote_state = match state.quote_state {
                     ExpandableQuote::Unquoted => ExpandableQuote::Double,
@@ -603,7 +570,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             //            case 'is_blank' also returns true for newlines
             _ if is_blank(ch) => {
                 state.lexeme_append(cursor.move_to(index));
-                state.lexeme_delimit(&mut heredoc_nesting);
+                state.lexeme_delimit();
 
                 // Skip continguous <blank>
                 walker.skip_blanks(&mut cursor, index + ' '.len_utf8());
@@ -612,7 +579,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                     Some('\n') => {}                // Skip trailing <blank>
                     Some(';') => {}                 // Skip trailing <blank>
                     Some('&') => {}                 // Skip trailing <blank>
-                    _ if state.is_first_token => {} // Skip leading <blank>
+                    _ if state.output_index == 0  => {} // Skip leading <blank>
                     // else no leading blank
                     _ => state.emit(Lexeme::Separator),
                 }
@@ -620,22 +587,25 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
 
             // Single quote
             '\'' => {
-                state.flags.set(HAS_QUOTE);
+                state.flags.set(HAS_SINGLE_OR_DOUBLE_QUOTE);
                 state.lexeme_append(cursor.move_to(index));
                 cursor.move_to(index + 1); // Skip opening quote
                 if let Some(closing_quote) = walker.next_till(|c| c == '\'') {
                     state.lexeme_append(cursor.move_to(closing_quote));
-                    state.lexeme_delimit(&mut heredoc_nesting);
+                    state.lexeme_delimit();
                     cursor.move_to(closing_quote + 1); // Skip closing quote
                 } else {
                     panic!("Unterminated single quote");
                 }
-                state.flags.unset(HAS_QUOTE);
+                state.flags.unset(HAS_SINGLE_OR_DOUBLE_QUOTE);
             }
+
+            //'(' => {
+            //}
 
             ')' if state.depth_of(Nestable::Parenthesis) > 0 => {
                 state.lexeme_append(cursor.move_to(index));
-                state.lexeme_delimit(&mut heredoc_nesting);
+                state.lexeme_delimit();
 
                 match (state.current_nesting_type(), walker.peek()) {
                     (Some(Nestable::Arithmetic), Some((_, _, ')', _))) => {
@@ -664,7 +634,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             '<' => {
                 let till_now = cursor.move_to(index);
                 state.lexeme_append(till_now);
-                state.lexeme_delimit(&mut heredoc_nesting);
+                state.lexeme_delimit();
 
                 match (rest_of_line.get(1..2), rest_of_line.get(2..3)) {
                     // @HEREDOC Step 1.1
@@ -692,7 +662,6 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             '&' => state.end_command_and_walk_to_next_token(
                 &mut walker,
                 &mut cursor,
-                &mut heredoc_nesting,
                 index,
                 ch,
                 Lexeme::EndOfBackgroundCommand,
@@ -700,7 +669,6 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
             ';' => state.end_command_and_walk_to_next_token(
                 &mut walker,
                 &mut cursor,
-                &mut heredoc_nesting,
                 index,
                 ch,
                 Lexeme::EndOfCommand,
@@ -712,24 +680,24 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
 
             //'{' => {
             //    state.lexeme_append(cursor.move_to(index));
-            //    state.lexeme_delimit(&mut heredoc_nesting);
+            //    state.lexeme_delimit();
             //    cursor.move_to(index + '{'.len_utf8());
             //    state.emit(Lexeme::ClosureStart);
             //}
             //'}' => {
             //    state.lexeme_append(cursor.move_to(index));
-            //    state.lexeme_delimit(&mut heredoc_nesting);
+            //    state.lexeme_delimit();
             //    cursor.move_to(index + '}'.len_utf8());
             //    state.emit(Lexeme::ClosureClose);
             //}
 
             // @POSIX 2.10.2 (Step 7) Shell Grammar Rules
             // @TODO if first word starts with '='
-            '=' if state.is_first_token => {
+            '=' if state.output_index == 0 => {
                 state.lexeme_append(cursor.move_to(index));
                 let buffer = &state.buffer;
                 if !buffer.is_empty() && is_valid_variable_name(buffer) {
-                    state.lexeme_delimit(&mut heredoc_nesting);
+                    state.lexeme_delimit();
                     cursor.move_to(index + '='.len_utf8());
                     state.emit(Lexeme::OpAssign);
                 }
@@ -741,7 +709,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
 
                 // @TODO logic errors here
                 if state.buffer.is_empty() {
-                    state.lexeme_delimit(&mut heredoc_nesting);
+                    state.lexeme_delimit();
                     let after_pound = index + '#'.len_utf8();
                     cursor.move_to(after_pound);
 
@@ -750,13 +718,14 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                     state.emit(Lexeme::Comment(body[till_newline].into()));
                 }
             }
+
             _ => {} // Allow it to perform 'walker.next()' in peace
         }
 
         // @TODO if check if quote level is not UNQUOTED
     }
 
-    state.lexeme_delimit(&mut heredoc_nesting);
+    state.lexeme_delimit();
 }
 
 // @POSIX 2.10.2 (Step 7b) Shell Grammar Rules, 3.230 Name
@@ -849,7 +818,7 @@ echo hello
         //let (producer, consumer) = futures::channel::mpsc::unbounded::<Lexeme>();
 
         let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
-        let input = SCRIPT3;
+        let input = SCRIPT2;
         let script_stream = stream::iter(vec![input]);
         task::block_on(async {
             println!("I am doing things\n====");
