@@ -71,19 +71,25 @@ impl<'a> TextGridWalk<'a> {
         self.peek
     }
 
+    // Because peek sets 'self.index' this is the closing index of a character
+    // When '.next()' evaluates to 'None', returns the original buffer length
+    pub fn current_end_index(&self) -> usize {
+        self.index
+    }
+
     /// NOTE: Unlike 'peek()' this calls 'next()' which means it will progress
     /// the iterator
-    pub fn peek_while<F>(&mut self, predicate: F) -> Option<usize>
+    pub fn peek_while<F>(&mut self, predicate: F) -> usize
     where
         F: Fn(char) -> bool,
     {
         loop {
             if let Some((_, index, c, _)) = self.peek {
                 if !predicate(c) {
-                    break Some(index);
+                    break index;
                 }
             } else {
-                break None;
+                break self.current_end_index();
             }
             self.next(); // 'peek()' and 'next()' are 'None' at the same time
         }
@@ -116,6 +122,11 @@ fn grid_walk_hits_unicode_boundaries() {
         assert_eq!(ch1, ch2);
         assert_eq!(Some(ch1), buffer[index..].chars().next());
     });
+    let walker = &mut TextGridWalk::new(buffer);
+    while let Some(_tuple) = walker.next() {
+        //println!("{} {:?}", walker.current_end_index(), _tuple);
+    }
+    assert_eq!(walker.current_end_index(), buffer.len());
     //TextGridWalk::new(buffer).for_each(|tuple| println!("{:?}", tuple));
 }
 

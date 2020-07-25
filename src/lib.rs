@@ -286,7 +286,7 @@ impl<'a> LexemeBuilder<'a> {
 
         // Skip until the next non-blank, non-newline character
         let non_blank = walker.peek_while(|c| is_blank(c) || c == '\n');
-        cursor.move_to(non_blank.unwrap_or(index + ch.len_utf8()));
+        cursor.move_to(non_blank);
     }
 
     // @HEREDOC Step 4
@@ -322,11 +322,7 @@ impl<'a> LexemeBuilder<'a> {
                 self.lexeme_delimit();
                 self.emit(Lexeme::HereDocClose);
 
-                let after_closer = walker
-                    .peek_while(|c| c != '\n')
-                    // @TODO remove need for this (confuses)
-                    .unwrap_or(after_newline + delim_len) // no newline
-                    ;
+                let after_closer = walker.peek_while(|c| c != '\n');
                 cursor.move_to(after_closer);
 
                 self.quote_state = ExpandableQuote::Unquoted;
@@ -349,9 +345,8 @@ type Info = (usize, usize);
 impl<'a> TextGridWalk<'a> {
     // @TODO: double check if this starter_index is necessary or if we can
     //        just use a value within self
-    fn skip_blanks(&mut self, cursor: &mut Cursor, starter_index: usize) {
-        let nonblank_index = self.peek_while(is_blank);
-        cursor.move_to(nonblank_index.unwrap_or(starter_index));
+    fn skip_blanks(&mut self, cursor: &mut Cursor) {
+        cursor.move_to(self.peek_while(is_blank));
     }
 }
 
@@ -573,7 +568,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 state.lexeme_delimit();
 
                 // Skip continguous <blank>
-                walker.skip_blanks(&mut cursor, index + ' '.len_utf8());
+                walker.skip_blanks(&mut cursor);
 
                 match walker.peek().map(|(_, _, c, _)| c) {
                     Some('\n') => {}                // Skip trailing <blank>
@@ -642,14 +637,14 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                         state.flags.set(BUILD_DELIM_TAB);
                         walker.next();
                         walker.next();
-                        walker.skip_blanks(&mut cursor, index + "<<-".len());
+                        walker.skip_blanks(&mut cursor);
                         state.emit(Lexeme::OpInputHereDoc);
                     }
                     // @HEREDOC Step 1.2
                     (Some("<"), _) => {
                         state.flags.set(BUILD_DELIM);
                         walker.next();
-                        walker.skip_blanks(&mut cursor, index + "<<".len());
+                        walker.skip_blanks(&mut cursor);
                         state.emit(Lexeme::OpInputHereDoc);
                     }
                     _ => {
@@ -710,12 +705,11 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
                 // @TODO logic errors here
                 if state.buffer.is_empty() {
                     state.lexeme_delimit();
-                    let after_pound = index + '#'.len_utf8();
-                    cursor.move_to(after_pound);
+                    cursor.move_to(index + '#'.len_utf8());
 
-                    let before_newline = walker.peek_while(|c| c != '\n').unwrap_or(after_pound);
-                    let till_newline = cursor.move_to(before_newline);
-                    state.emit(Lexeme::Comment(body[till_newline].into()));
+                    let before_newline = walker.peek_while(|c| c != '\n');
+                    cursor.move_to(before_newline);
+                    state.emit(Lexeme::Comment(rest_of_line[1..].into()));
                 }
             }
 
