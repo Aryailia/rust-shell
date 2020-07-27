@@ -1,0 +1,27 @@
+Do I need to introduce this?
+
+Typically any sort of compiler/interpreter, the first section is the first step is the parser step, which is typically separated into two parts: the 'lexer' and the 'parser' (not really that different from each other). The job is to turn the source text into a series of tokens that is easier to work with....
+
+
+
+
+The pipeline of POSIX shellscript seems to be: 
+. The lexer which is essentially laid out in https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_04[2.3 Token Recognition]
+  . Backslash, single-quote, double-quote, and here-documents are the four ways to quote
+  . Quoted sections retain their quoting method in a the lexeme. However it should be possible to implement a lexer that eagerly removes these quotes. (My initial attempt did indeed eagerly remove, but I decided to err on the side of better compliance with POSIX) (TODO: link to the change that did this)
+  . Escaped newline is removed at step 4, so in 1) direct text, 2) double-quotes, and 3) here-documents, escaped newlines is lexed as if deleted from the source file
+
+. The parser is essentially laid out in https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_10[2.10 Shell Grammar]
+  . Reserved words recognition happens before quote removal, so `for''` is not a reserved word. Escaped newlines are deleted so `for\<newline>` will be recognised as a built-in command
+  . Reserved words need spaces. Sub-shell parentheses are recognized. It is not really listed anywhere the order/reason when this should happen, but 2.6 Word Expansions into 2.9.4 Compound commands might sort of be the reasoning...
+  . *On the Here-document Delimtier Processing*: Although in 2.6 says quote removal happens last after all the other expansions, 2.10 Shell Grammar Step 3 removes the quotes first to determine the here-document delimiter. This means `<"EOF $("  " echo yo )"` is lexed as 1) `<"EOF $("` 2) `" echo yo)"`.
+
+. Word expansion then takes over. See 2.6 Word Expansion. Of note are:
+  . Tilde expansion
+  . Command expansion
+  . etc.
+
+== To Do
+* Further explore changing the lexer to be references. Probably cannot because command expansion might will lead to weird lifetimes on the Lexeme Stream, maybe.
+
+
