@@ -97,7 +97,37 @@ enum Lexeme {
 
 // Token, Strip Tabs?, Quoted Delim?
 type HereDocDelimList = VecDeque<(String, bool, bool)>;
+type Info = (usize, usize);
 
+// Need one per file source processed
+// In charge of
+struct LexemeBuilder<'a> {
+    //flags: Flag,
+    buffer: LexemeBuffer<'a>,
+    nesting: NestingTracker,
+    heredoc_delim_list: HereDocDelimList,
+}
+
+// For keeping mutability of .'buffer' and use of 'emitter' to local methods
+impl<'a> LexemeBuilder<'a> {
+    fn new(buffer: &'a str, emitter: &'a mut dyn FnMut(Lexeme)) -> Self {
+        Self {
+            //flags: Flag::new(),
+            buffer: LexemeBuffer {
+                source: buffer,
+                // @TODO find a good size to init this to
+                buffer: String::new(),
+                output_index: 0,
+                emitter: emitter,
+            },
+            nesting: NestingTracker {
+                stack: Vec::new(),
+                depth: [0; NEST_TOTAL_SIZE],
+            },
+            heredoc_delim_list: HereDocDelimList::new(),
+        }
+    }
+}
 
 struct LexemeBuffer<'a> {
     source: &'a str,
@@ -113,9 +143,11 @@ impl<'a> LexemeBuffer<'a> {
     fn is_first_lexeme(&self) -> bool {
         self.output_index == 0
     }
-    fn substr(&self, range: Range<usize>) -> &str {
-        &self.source[range]
-    }
+
+    // @TODO Not sure how to make this more idiomatic
+    //fn substr(&self, range: Range<usize>) -> &str {
+    //    &self.source[range]
+    //}
 
     // Do not interact with buffer, emit custom
     fn emit(&mut self, lexeme: Lexeme) {
@@ -170,7 +202,6 @@ impl<'a> LexemeBuffer<'a> {
     }
 }
 
-
 // Basically the state changer for the finite state machine
 struct NestingTracker {
     stack: Vec<(LexMode, Info)>,
@@ -213,38 +244,6 @@ impl NestingTracker {
     }
 }
 
-// Need one per file source processed
-// In charge of
-struct LexemeBuilder<'a> {
-    source: &'a str,
-    //flags: Flag,
-    buffer: LexemeBuffer<'a>,
-    nesting: NestingTracker,
-    heredoc_delim_list: HereDocDelimList,
-}
-
-// For keeping mutability of .'buffer' and use of 'emitter' to local methods
-impl<'a> LexemeBuilder<'a> {
-    fn new(buffer: &'a str, emitter: &'a mut dyn FnMut(Lexeme)) -> Self {
-        Self {
-            source: buffer,
-            //flags: Flag::new(),
-            buffer: LexemeBuffer {
-                source: buffer,
-                // @TODO find a good size to init this to
-                buffer: String::new(),
-                output_index: 0,
-                emitter: emitter,
-            },
-            nesting: NestingTracker {
-                stack: Vec::new(),
-                depth: [0; NEST_TOTAL_SIZE],
-            },
-            heredoc_delim_list: HereDocDelimList::new(),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct Cursor {
     index: usize,
@@ -276,36 +275,14 @@ impl Cursor {
 // @TEST $( ` ) `     - mismatched nestings
 // @TEST: \<EOF>
 
-// Random helper methods
-impl<'a> LexemeBuilder<'a> {
-    // @VOLATILE: Coordinate with ending heredoc branch of '\n'
-    //            Does not seem like heredoc needs ot set '.output_index'
-    fn end_command_and_walk_to_next_token(
-        &mut self,
-        walker: &mut TextGridWalk,
-        cursor: &mut Cursor,
-        token: Lexeme,
-    ) {
-        // Skip if current line is a blank line
-        if !self.buffer.is_first_lexeme() {
-            self.buffer.emit(token);
-            self.buffer.output_index = 0;
-        }
-        // Skip until the next non-blank, non-newline character
-        let non_blank = walker.peek_while(|c| is_blank(c) || c == '\n');
-        cursor.move_to(non_blank);
-    }
-}
-
-type Info = (usize, usize);
 impl<'a> TextGridWalk<'a> {
     fn peek_while_varname(&mut self) -> Option<usize> {
         self.peek().and_then(|(rest_of_line, i, _, _)| {
             let varname_end = i + find_valid_variable_name(rest_of_line);
             if varname_end > i {
                 while let Some(_) = self.next() {
-                    if self.current_end_index() == varname_end  {
-                        break
+                    if self.current_end_index() == varname_end {
+                        break;
                     }
                 }
                 Some(self.current_end_index())
@@ -314,7 +291,6 @@ impl<'a> TextGridWalk<'a> {
             }
         })
     }
-
 
     fn walk_to_heredoc_delim_end(&mut self) -> (String, bool) {
         self.peek_while(is_blank);
@@ -403,7 +379,6 @@ impl<'a> TextGridWalk<'a> {
                 let end = self.current_end_index();
                 end - '\\'.len_utf8()..end
             }
-
         }
     }
 }
@@ -414,15 +389,16 @@ impl<'a> TextGridWalk<'a> {
 // I am doing the same as Dash: '<<EOF cat -\nhello\nEOF' is valid
 // Expecting to enter after the '\n'
 fn lexmode_here_document(
-    state: &mut LexemeBuilder,
+    LexemeBuilder {
+        buffer,
+        nesting,
+        heredoc_delim_list,
+        ..
+    }: &mut LexemeBuilder,
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
 ) -> bool {
     //@TODO: validate token, error if have newlines inside it
-    let buffer = &mut state.buffer;
-    let nesting = &mut state.nesting;
-    let heredoc_delim_list = &mut state.heredoc_delim_list;
-
     let delim_entry = heredoc_delim_list.front().unwrap();
     let (token, is_strip_tabs, is_delim_quoted) = delim_entry;
 
@@ -472,14 +448,14 @@ fn lexmode_here_document(
 }
 
 fn lexmode_double_quote(
-    state: &mut LexemeBuilder,
+    LexemeBuilder {
+        buffer, nesting, ..
+    }: &mut LexemeBuilder,
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
 ) -> bool {
     while let Some(item) = walker.next() {
         let (_, index, ch, info) = item;
-        let buffer = &mut state.buffer;
-        let nesting = &mut state.nesting;
         match ch {
             '"' => {
                 buffer.push_range(cursor.move_to(index));
@@ -515,12 +491,20 @@ fn lexmode_double_quote(
 // @TODO: Make it so that we do not allocate 'buffer' several times,
 //        perhaps a second buffer in state?
 // @TODO: loop through all continguous escape sequences, optimisation?
-fn lexmode_backtick(state: &mut LexemeBuilder, walker: &mut TextGridWalk, cursor: &mut Cursor) -> bool {
+fn lexmode_backtick(
+    state: &mut LexemeBuilder,
+    walker: &mut TextGridWalk,
+    cursor: &mut Cursor,
+) -> bool {
+    let LexemeBuilder {
+        buffer, nesting, ..
+    } = state;
+
     match walker.next() {
         Some((_, _, '\\', info)) => {
             // Double because two escaped backslash is "\\\\" or r"\\"
-            let nest_depth = state.nesting.depth_of(LexMode::Backtick) * 2;
-            let mut buffer = String::with_capacity(nest_depth);
+            let nest_depth = nesting.depth_of(LexMode::Backtick) * 2;
+            let mut temp = String::with_capacity(nest_depth);
 
             // @TODO more comments
             // @HALFPOSIX: This avoid recursively calling lex backtick
@@ -532,27 +516,29 @@ fn lexmode_backtick(state: &mut LexemeBuilder, walker: &mut TextGridWalk, cursor
                     Some((_, _, '\\', _)) => {
                         walker.next(); // move to second backslash
                         walker.next(); // move to next escaping pair
-                        buffer.push('\\');
-                        buffer.push('\\');
+                        temp.push('\\');
+                        temp.push('\\');
                         continue;
                     }
                     Some((_, _, '`', _)) => {
                         walker.next(); // move to backtick
-                        // 'buffer' only has backslashes or is "" here
-                        let backslash_count = buffer.len();
-                        //println!("tick {:?} - {} {}", buffer, backslash_count, nest_depth);
+                                       // 'temp' only has backslashes or is "" here
+                        let backslash_count = temp.len();
+                        //println!("tick {:?} - {} {}", temp, backslash_count, nest_depth);
 
                         // Extra `+ 2` or one extra nesting from just plain '`'
                         if backslash_count + 2 == nest_depth {
-                            state.buffer.emit(Lexeme::SubShellStart);
-                            state.nesting.start(&mut state.buffer, info, LexMode::Backtick);
-                            buffer.clear()
+                            buffer.emit(Lexeme::SubShellStart);
+                            state
+                                .nesting
+                                .start(buffer, info, LexMode::Backtick);
+                            temp.clear()
 
                         // Two more nestings (+ 4) (r"\\\`" is third level)
                         } else if backslash_count + 4 >= nest_depth {
-                            state.buffer.emit(Lexeme::SubShellClose);
-                            state.nesting.close(LexMode::Backtick).unwrap();
-                            buffer.truncate(backslash_count + 4 - nest_depth);
+                            buffer.emit(Lexeme::SubShellClose);
+                            nesting.close(LexMode::Backtick).unwrap();
+                            temp.truncate(backslash_count + 4 - nest_depth);
                         } else {
                             panic!("mismatched backticks");
                         }
@@ -561,7 +547,7 @@ fn lexmode_backtick(state: &mut LexemeBuilder, walker: &mut TextGridWalk, cursor
                     // Same as lex_regular, just without moving a cursor
                     _ => {
                         let range = walker.walk_regular_backslash();
-                        buffer.push_str(&state.source[range]);
+                        temp.push_str(&buffer.source[range]);
                     }
                 }
                 break;
@@ -569,27 +555,31 @@ fn lexmode_backtick(state: &mut LexemeBuilder, walker: &mut TextGridWalk, cursor
 
             // Append buffer
             cursor.move_to(walker.current_end_index());
-            state.buffer.push_str(buffer.as_str());
+            buffer.push_str(temp.as_str());
         }
         Some((_, index, '`', _)) => {
-            state.buffer.push_range(cursor.move_to(index));
-            state.buffer.delimit();
-            state.nesting.close(LexMode::Backtick).unwrap();
-            state.buffer.emit(Lexeme::SubShellClose);
+            buffer.push_range(cursor.move_to(index));
+            buffer.delimit();
+            nesting.close(LexMode::Backtick).unwrap();
+            buffer.emit(Lexeme::SubShellClose);
             cursor.move_to(index + '`'.len_utf8());
         }
 
-        Some(entry) => lex_regular(entry, state, walker, cursor),
+        Some(entry) => lex_regular(walker, cursor, state, entry),
         None => return false,
     }
     true
 }
 
-fn lexmode_parameter(state: &mut LexemeBuilder, walker: &mut TextGridWalk, cursor: &mut Cursor) -> bool {
+fn lexmode_parameter(
+    state: &mut LexemeBuilder,
+    walker: &mut TextGridWalk,
+    cursor: &mut Cursor,
+) -> bool {
     if let Some(entry) = walker.next() {
         let (_, index, ch, _) = entry;
         match ch {
-            '\\' | '"' | '\'' => lex_regular(entry, state, walker, cursor),
+            '\\' | '"' | '\'' => lex_regular(walker, cursor, state, entry),
             '}' => {
                 let substr = &state.buffer.source[cursor.move_to(index)];
                 state.nesting.close(LexMode::Parameter).unwrap();
@@ -620,12 +610,11 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
         // @TODO: parens
         // @TODO: curly braces
         // @TODO: operators
-        // @TODO: $
 
         let is_continue = match mode {
             LexMode::Regular | LexMode::Parenthesis | LexMode::Arithmetic => {
-                if let Some(item) = walker.next() {
-                    lex_regular(item, state, walker, cursor);
+                if let Some(entry) = walker.next() {
+                    lex_regular(walker, cursor, state, entry);
                     true
                 } else {
                     false
@@ -706,7 +695,6 @@ fn lex_dollar(
                     buffer.emit(Lexeme::Variable(name.into()));
                 });
             }
-
         }
     }
 }
@@ -718,15 +706,31 @@ fn lex_backslash(walker: &mut TextGridWalk, cursor: &mut Cursor, buffer: &mut Le
     cursor.move_to(walker.current_end_index());
 }
 
-
-fn lex_regular(
-    (rest_of_line, index, ch, info): <TextGridWalk as Iterator>::Item,
-    state: &mut LexemeBuilder,
+// @VOLATILE: Coordinate with ending heredoc branch of '\n'
+//            Does not seem like heredoc needs ot set '.output_index'
+fn lex_command_end_and_eat_whitespace(
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
+    buffer: &mut LexemeBuffer,
+    token: Lexeme,
 ) {
-    let buffer = &mut state.buffer;
-    let nesting = &mut state.nesting;
+    if !buffer.is_first_lexeme() {
+        buffer.emit(token);
+        buffer.output_index = 0;
+    }
+    // Skip until the next non-blank, non-newline character
+    let non_blank = walker.peek_while(|c| is_blank(c) || c == '\n');
+    cursor.move_to(non_blank);
+}
+
+fn lex_regular(
+    walker: &mut TextGridWalk,
+    cursor: &mut Cursor,
+    LexemeBuilder {
+        buffer,nesting,heredoc_delim_list,..
+    }: &mut LexemeBuilder,
+    (rest_of_line, index, ch, info): <TextGridWalk as Iterator>::Item,
+) {
     match ch {
         '\\' => lex_backslash(walker, cursor, buffer),
         '\'' => {
@@ -751,20 +755,20 @@ fn lex_regular(
         '\n' => {
             buffer.push_range(cursor.move_to(index));
             buffer.delimit();
-            if state.heredoc_delim_list.is_empty() {
-                state.end_command_and_walk_to_next_token(walker, cursor, Lexeme::EndOfCommand);
+            if heredoc_delim_list.is_empty() {
+                lex_command_end_and_eat_whitespace(walker, cursor, buffer, Lexeme::EndOfCommand);
 
             // If the delim was never finished by newline, error
             // @POSIX 2.9
-            } else { // 'state.heredoc_delim_list' is not empty
-
+            // 'heredoc_delim_list' is not empty
+            } else {
                 cursor.move_to(index + '\n'.len_utf8());
                 buffer.emit(Lexeme::EndOfCommand);
                 buffer.emit(Lexeme::HereDocStart);
                 nesting.start(buffer, info, LexMode::HereDocument);
 
                 //@TODO: validate token, error if have newlines inside it
-                let entry = state.heredoc_delim_list.front().unwrap();
+                let entry = heredoc_delim_list.front().unwrap();
                 let (_token, is_strip_tabs, _) = entry;
 
                 // Handle if first character if is tab
@@ -797,7 +801,12 @@ fn lex_regular(
         '&' => {
             buffer.push_range(cursor.move_to(index));
             buffer.delimit();
-            state.end_command_and_walk_to_next_token(walker, cursor, Lexeme::EndOfBackgroundCommand);
+            lex_command_end_and_eat_whitespace(
+                walker,
+                cursor,
+                buffer,
+                Lexeme::EndOfBackgroundCommand,
+            );
         }
 
         ';' => {
@@ -806,7 +815,7 @@ fn lex_regular(
             if let Some((_, _, ';', _)) = walker.peek() {
                 buffer.emit(Lexeme::Debug("Break".into()));
             } else {
-                state.end_command_and_walk_to_next_token(walker, cursor, Lexeme::EndOfCommand);
+                lex_command_end_and_eat_whitespace(walker, cursor, buffer, Lexeme::EndOfCommand);
             }
         }
 
@@ -852,8 +861,7 @@ fn lex_regular(
                     }
                     let (delim, is_quoted) = walker.walk_to_heredoc_delim_end();
 
-                    state
-                        .heredoc_delim_list
+                    heredoc_delim_list
                         .push_back((delim, is_strip, is_quoted));
                     cursor.move_to(walker.peek_while(is_blank));
                     buffer.emit(Lexeme::OpInputHereDoc);
@@ -867,8 +875,9 @@ fn lex_regular(
 
         // @TODO Rust RFC 2353 issue #60553 means no more allocation
         '=' if buffer.is_first_lexeme() => {
-            let varname = &state.source[cursor.span(index)];
-            if !varname.is_empty() && is_valid_variable_name(varname) {
+            let varname = &buffer.source[cursor.span(index)];
+            let is_valid = find_valid_variable_name(varname) == varname.len();
+            if !varname.is_empty() && is_valid {
                 buffer.emit(Lexeme::Variable(varname.into()));
                 cursor.move_to(index + '='.len_utf8());
                 buffer.emit(Lexeme::OpAssign);
@@ -889,29 +898,24 @@ fn lex_regular(
     }
 }
 
-// @POSIX 2.10.2 (Step 7b) Shell Grammar Rules, 3.230 Name
-fn is_valid_variable_name(ident: &str) -> bool {
-    let mut chars = ident.chars();
-    let test_first_char = chars
-        .next()
-        .map(|c| c.is_ascii_alphabetic() || c == '_') // Not digit
-        .unwrap_or(false);
-    test_first_char && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
+// @POSIX 2.10.2 (Step 7b) Shell Grammar Rules
+// @POSIX 3.230 Name
+//
+// Finds the end index that constitute a valid variable name
 fn find_valid_variable_name(ident: &str) -> usize {
     let mut chars = ident.chars();
     let default = 0 as char;
     debug_assert!(!default.is_ascii_alphabetic() && default != '_');
     let first_char = chars.next().unwrap_or(default);
 
-    if first_char.is_ascii_alphabetic() || first_char == '_' { // Not digit
+    if first_char.is_ascii_alphabetic() || first_char == '_' {
+        // Not digit
         let mut sum = first_char.len_utf8();
         while let Some(c) = chars.next() {
             if c.is_ascii_alphanumeric() || c == '_' {
                 sum += c.len_utf8();
             } else {
-                break
+                break;
             }
         }
         sum
@@ -1008,7 +1012,7 @@ echo "hello " bub
         //let (producer, consumer) = futures::channel::mpsc::unbounded::<Lexeme>();
 
         let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
-        let input = SCRIPT2;
+        let input = SCRIPT3;
         let script_stream = stream::iter(vec![input]);
         task::block_on(async {
             println!("I am doing things\n====");
