@@ -1,4 +1,4 @@
-//run: cargo test parser_tests -- --nocapture
+//run: cargo test shell_tests -- --nocapture
 
 // Dash is: git.kernel.org/pub/scm/utils/dash.git
 #![allow(dead_code, unused_imports)]
@@ -13,7 +13,7 @@ use lexer::{job_stream_lex, Lexeme};
 use parser::job_stream_parse;
 
 #[cfg(test)]
-mod parser_tests {
+mod shell_tests {
     use super::*;
 
     const SCRIPT: &str = r##"#!/bin/ashell
@@ -69,7 +69,7 @@ echo "hello " bub
 
     #[test]
     fn development() {
-        let input = r"sed -n 's/ *//' ~/.enivironment/bookmarks.yml";
+        let input = r"sed 's/ *|//' ~/.environment/bookmarks.csv";
         let script_stream = stream::iter(vec![input]);
         let (lex_tx, lex_rx) = futures::channel::mpsc::unbounded::<Lexeme>();
 
