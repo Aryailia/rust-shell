@@ -1,3 +1,5 @@
+//run: cargo test shell_tests -- --nocapture
+
 // @TODO echo `printf %s\\\n`  - figure out what should be done in this case
 
 // Dash is: git.kernel.org/pub/scm/utils/dash.git
@@ -422,7 +424,7 @@ fn lexmode_here_document(
             }
             _ if *is_delim_quoted => {} // Always literal
 
-            // See 'lex_double_quote()' for why these are not special cased
+            // See 'lexmode_double_quote()' for why these are not special cased
             '\\' => lex_backslash(walker, cursor, buffer),
             '`' => {
                 lex_backtick(walker, cursor, buffer, nesting, info);
@@ -454,9 +456,8 @@ fn lexmode_double_quote(
         let (_, index, ch, info) = item;
         match ch {
             '"' => {
-                buffer.push_range(cursor.move_to(index));
+                buffer.push_range(cursor.move_to(index + '"'.len_utf8()));
                 nesting.close(LexMode::DoubleQuote).unwrap();
-                cursor.move_to(index + '"'.len_utf8());
                 return true;
             }
 
@@ -472,11 +473,11 @@ fn lexmode_double_quote(
             '\\' => lex_backslash(walker, cursor, buffer),
             '`' => {
                 lex_backtick(walker, cursor, buffer, nesting, info);
-                break; // because this nests
+                return true; // because this nests
             }
             '$' => {
                 lex_dollar(walker, cursor, buffer, nesting, info);
-                break; // because this nests
+                return true; // because this nests
             }
             _ => {}
         }
@@ -614,6 +615,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
         // @TODO: parens
         // @TODO: curly braces
         // @TODO: operators
+        //println!("Mode {:?} {:?}", mode, walker.peek());
 
         let is_continue = match mode {
             LexMode::Regular | LexMode::Parenthesis | LexMode::Arithmetic => {
