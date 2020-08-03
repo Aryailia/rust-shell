@@ -1,89 +1,382 @@
 //run: cargo test shell_tests -- --nocapture
 
 use crate::lexer::Lexeme;
-use futures::{future, stream, stream::Stream, StreamExt};
-use std::mem::{discriminant, take};
-use std::process::Command;
 
-fn dummy_is_valid(lexeme: &Lexeme) -> bool {
-    match lexeme {
-        Lexeme::Word(word) => word.chars().all(|c| c.is_ascii_alphanumeric()),
-        _ => false
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::stream::{Peekable, Stream};
+use futures::{future, stream, StreamExt};
+use std::io;
+use std::mem::{discriminant, replace};
+use std::pin::Pin;
+use std::process::{Command, Stdio};
+
+type ParserInput = UnboundedReceiver<Lexeme>;
+
+#[derive(Debug)]
+enum BuilderState {
+    Regular,
+    Word,
+}
+
+#[derive(Debug)]
+pub enum Statement {
+    Assign,
+    Label(usize),
+    External(Executable),
+    Debug(Vec<Lexeme>),
+}
+
+#[derive(Clone, Debug)]
+enum FileId {
+    Descriptor(usize),
+    Path(String),
+    Temp(usize, usize),
+    Piped,
+}
+
+//impl FileId {
+//    // @TODO Change to From<_>?
+//    //fn redirect<F: Fn(Into<Stdio>>)>(&self, handle: F) {
+//    //    //match self {
+//    //    //    FileId::Descriptor(0) => handle(io::stdin()),
+//    //    //    FileId::Descriptor(1) => handle(io::stdout()),
+//    //    //    FileId::Descriptor(2) => handle(io::stderr()),
+//    //    //    FileId::Descriptor(_) => todo!(),
+//    //    //    FileId::Path(_) => handle(Stdio::piped()),
+//    //    //    FileId::Piped => handle(Stdio::piped()),
+//    //    //}
+//    //}
+//}
+
+#[derive(Debug)]
+struct StatementBuilder {
+    output: UnboundedSender<Statement>,
+    nesting: ParserNesting,
+    mode: BuilderState,
+    buffer: Vec<Lexeme>,
+    label: usize,
+    current_handles: Option<IoHandles>,
+}
+
+//#[derive(Debug)]
+pub struct Executable {
+    args: Vec<Lexeme>,
+    handles: IoHandles,
+}
+
+impl std::fmt::Debug for Executable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Executable({:?}    <{} >{} 2>{})",
+            self.args,
+            match &self.handles.stdin {
+                FileId::Descriptor(0) => "&0".to_string(),
+                FileId::Descriptor(1) => "&1".to_string(),
+                FileId::Descriptor(2) => "&2".to_string(),
+                FileId::Path(s) => format!("{:?}", s),
+                _ => format!("{:?}", self.handles.stdin),
+            },
+            match &self.handles.stdout {
+                FileId::Descriptor(0) => "&0".to_string(),
+                FileId::Descriptor(1) => "&1".to_string(),
+                FileId::Descriptor(2) => "&2".to_string(),
+                FileId::Path(s) => format!("{:?}", s),
+                _ => format!("{:?}", self.handles.stdout),
+            },
+            match &self.handles.stderr {
+                FileId::Descriptor(0) => "&0".to_string(),
+                FileId::Descriptor(1) => "&1".to_string(),
+                FileId::Descriptor(2) => "&2".to_string(),
+                FileId::Path(s) => format!("{:?}", s),
+                _ => format!("{:?}", self.handles.stderr),
+            },
+        )
     }
 }
 
-fn parse_statement(statement: Vec<Lexeme>) -> Option<()> {
-    debug_assert_eq!(statement.is_empty(), false);
-    let mut arg_list = statement.iter();
-    let first_lexeme = arg_list.next().unwrap();
-    if dummy_is_valid(first_lexeme) {
-        let cmd = match first_lexeme {
-            Lexeme::Word(word) => word,
-            x => unreachable!("Should be a Lexeme::Word: {:?}", x),
-        };
+impl Executable {
+    // @TODO Change to From<_>?
+    //fn run(&self) {
+    //    let mut args = self.args.iter();
+    //    let mut cmd = Command::new(args.next().unwrap());
+    //    cmd.args(args);
+    //    //match &self.stdin {
+    //    //    FileId::Descriptor(0) => cmd.stdin(io::stdin()),
+    //    //    FileId::Descriptor(1) => cmd.stdin(io::stdout()),
+    //    //    FileId::Descriptor(2) => cmd.stdin(io::stderr()),
+    //    //    FileId::Descriptor(_) => &mut cmd,
+    //    //    FileId::Path(_) => cmd.stdin(Stdio::piped()),
+    //    //    FileId::Piped => cmd.stdin(Stdio::piped()),
+    //    //};
+    //}
+}
 
-        let arg_list2 = arg_list.filter_map(|lexeme| {
-            match lexeme {
-                Lexeme::Word(word) => Some(word),
-                _ => None
+// @TODO @POSIX 2.7 Redirection says at least [0,9] shall be supported
+// Maybe an associated array or an array of (descripto
+#[derive(Clone, Debug)]
+struct IoHandles {
+    stdin: FileId,
+    stdout: FileId,
+    stderr: FileId,
+}
+
+impl IoHandles {
+    fn new() -> Self {
+        Self {
+            stdin: FileId::Descriptor(0),
+            stdout: FileId::Descriptor(1),
+            stderr: FileId::Descriptor(2),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ParserNesting {
+    level: usize,
+    default_stack: Vec<IoHandles>,
+    temp_stack: Vec<usize>,
+}
+impl ParserNesting {
+    fn new() -> Self {
+        Self {
+            level: 0, // The lengths of the below should = `level + 1`
+            // Keeping track of the IO handles for each nesting
+            default_stack: vec![IoHandles::new()],
+            // Keeping track of private variables if needed
+            temp_stack: vec![0],
+        }
+    }
+    fn start(&mut self, current: Option<IoHandles>) {
+        let level = self.level;
+
+        self.default_stack.push(current.unwrap_or(IoHandles {
+            stdin: self.default_stack[level].stdin.clone(),
+            stdout: FileId::Temp(level, 0),
+            stderr: self.default_stack[level].stderr.clone(),
+        }));
+        // 'temp_stack' is meant to be in sync with 'default_stack'
+        // Because this is after, in '.close()', we have to `- 1`
+        self.temp_stack[level] += 1;
+        self.temp_stack.push(0);
+        self.level += 1;
+        //println!("{:?}\n", self);
+    }
+
+    fn close(&mut self) -> (usize, usize) {
+        self.level -= 1;
+        let level = self.level;
+
+        self.default_stack.pop().expect("Unreachable");
+        self.temp_stack.pop().expect("Unreachable");
+        (level, self.temp_stack[level] - 1) // See '.start()' for the `- 1`
+    }
+
+    fn reset(&mut self) {
+        self.temp_stack[self.level] = 0;
+    }
+
+    fn copy_current(&self) -> IoHandles {
+        self.default_stack[self.level].clone()
+    }
+}
+
+impl StatementBuilder {
+    fn emit(&self, stmt: Statement)  {
+        self.output.unbounded_send(stmt).unwrap();
+    }
+
+
+    fn emit_statement(&mut self) -> Option<Statement> {
+        let len = self.buffer.len();
+        let last_unnested_index = self.buffer
+            .iter()
+            .rev()
+            .position(|lexeme| match lexeme {
+                Lexeme::ArithmeticStart(_)
+                | Lexeme::SubShellStart(_)
+                | Lexeme::ClosureStart(_) => true,
+                _ => false,
+            })
+            .map(|reverse_index| len - reverse_index)
+            .unwrap_or(0);
+
+        let args = self.buffer.split_off(last_unnested_index);
+
+        //println!("buffer {:?} {:?}", find_nest_start_index, self.buffer);
+        //match args.first() {
+        //    Some(Word
+        //    None => None
+        //}
+        if args.is_empty() {
+            None
+        } else {
+            //println!("{:?}\n", self.nesting);
+            //Some(Statement::Debug(args))
+            //let level = self.nesting.level;
+            //let id = self.nesting.var_id_stack[level];
+            //Some(Statement::External(Executable {
+            //    args,
+            //    stdin: self.stdin.replace_with_nesting_default(level, id),
+            //    stdout: self.stdout.replace_with_nesting_default(level, id),
+            //    stderr: self.stderr.replace_with_nesting_default(level, id),
+            //}))
+
+            let handles = replace(&mut self.current_handles, None)
+                .unwrap_or_else(|| self.nesting.copy_current());
+
+            self.current_handles = None;
+            Some(Statement::External(Executable {
+                args,
+                handles,
+            }))
+
+        }
+    }
+}
+
+
+
+//fn word_expand(word: String) -> String {
+//    QuoteWalker::with_parts_capacity(word.as_str(), 1)
+//}
+fn parse_regular(
+    builder: &mut StatementBuilder,
+    _stream: Pin<&mut Peekable<ParserInput>>,
+    lexeme: Lexeme,
+) -> Option<Statement> {
+    //println!("Lexeme {:?}", lexeme);
+
+    match &lexeme {
+        Lexeme::Comment(_) => None,
+        Lexeme::OpInputRedirect => {
+            None
+        }
+        Lexeme::EndOfCommand => {
+            builder.nesting.reset();
+            builder.emit_statement()
+        }
+        Lexeme::SubShellClose(_) | Lexeme::ClosureClose(_) => {
+            let stmt = builder.emit_statement();
+            if let None = builder.buffer.pop() { // remove the starter
+                unreachable!("The lexer should catch unmatched parens");
             }
-        }).collect::<Vec<_>>();
-        let output = Command::new(cmd)
-            .args(arg_list2)
-            .output()
-            .expect(format!("failed to execute cmd {}", cmd).as_str())
-            ;
-        println!("Output {:?}", String::from_utf8(output.stdout));
-        //println!("{:?}({:?})", cmd, arg_list2);
+            //println!("Nesting {:?}", builder.nesting);
 
-        Some(())
-    } else {
-        None
+            let handle = builder.nesting.close();
+            builder.buffer.push(Lexeme::Private(handle.0, handle.1));
+
+            stmt
+        }
+        Lexeme::Word(word) => {
+            match word.as_str() {
+                "for" => {}
+                _ => {}
+            }
+            builder.buffer.push(lexeme);
+            None
+        }
+        Lexeme::SubShellStart(_) | Lexeme::ClosureStart(_) => {
+            builder.nesting.start(builder.current_handles.clone());
+            builder.buffer.push(lexeme); // Important for 'emit_statement()'
+            None
+        }
+        _ => None,
     }
 }
 
+//async fn peek_till_after_close(
+//    builder: &mut StatementBuilder,
+//    stream: Pin<&mut Peekable<ParserInput>>,
+//    current: Lexeme,
+//) {
+//    let (closer, id) = match current {
+//        Lexeme::ArithmeticStart(id) => (Lexeme::ArithmeticClose(id), id),
+//        Lexeme::SubShellStart(id) => (Lexeme::SubShellClose(id), id),
+//        Lexeme::ClosureStart(id) => (Lexeme::ClosureClose(id), id),
+//        _ => unimplemented!(),
+//    };
+//    let close_type = discriminant(&closer);
+//    //let mut stream = Pin::new(stream);
+//
+//    builder.buffer.push(current);
+//
+//    while let Some(lexeme_ref) = stream.as_mut().peek().await {
+//        let peek_is_closer = discriminant(lexeme_ref) != close_type
+//            && match lexeme_ref {
+//                Lexeme::ArithmeticStart(id2) => id != *id2,
+//                Lexeme::SubShellStart(id2) => id != *id2,
+//                Lexeme::ClosureStart(id2) => id != *id2,
+//                _ => true,
+//            };
+//
+//        builder.buffer.push(stream.as_mut().next().await.unwrap());
+//        if peek_is_closer {
+//            break;
+//        }
+//    }
+//}
 
-pub async fn job_stream_parse<'a, T>(job_stream: T)
-where
-    T: Stream<Item = Lexeme> + Unpin,
-{
-    let mut statement_buffer = Vec::new();
-    job_stream
-        // Group by statements
-        .map(|lexeme| {
-            //println!("Lexeme {:?}", lexeme);
-            lexeme
-        })
-        .filter_map(|lexeme: Lexeme| {
-            let output = match lexeme {
-                Lexeme::Comment(_) => None,
-                Lexeme::EndOfCommand => {
-                    if statement_buffer.is_empty() {
-                        None
-                    } else {
-                        Some(take(&mut statement_buffer))
+
+//async fn peek_till_word_end(
+//    builder: &mut StatementBuilder,
+//    mut stream: Pin<&mut Peekable<ParserInput>>,
+//) -> Vec<Lexeme> {
+//    let mut output = Vec::new();
+//    while let Some(peek) = stream.as_mut().peek().await {
+//        match peek {
+//            Lexeme::Word(_) => {
+//                output.push(stream.as_mut().next().await.unwrap());
+//            }
+//            Lexeme::ArithmeticStart(_) | Lexeme::SubShellStart(_) | Lexeme::ClosureStart(_) => {
+//                //peek_till_after_close(builder, stream, stream.as_mut().next().await.unwrap());
+//                //next_till(builder.
+//            }
+//            _ => break,
+//        }
+//    }
+//    output
+//}
+
+pub async fn job_stream_parse(input: ParserInput, output: UnboundedSender<Statement>) {
+    let input = &mut input.peekable();
+
+    let builder = &mut StatementBuilder {
+        output,
+        nesting: ParserNesting::new(),
+        mode: BuilderState::Regular,
+        buffer: Vec::new(),
+        label: 0,
+        current_handles: None,
+    };
+
+    loop {
+        match builder.mode {
+            BuilderState::Regular => {
+                if let Some(lexeme) = input.next().await {
+                    if let Some(stmt) = parse_regular(builder, Pin::new(input), lexeme) {
+                        builder.output.unbounded_send(stmt).unwrap();
                     }
+                } else {
+                    break;
                 }
-                Lexeme::Word(word) => {
-                    statement_buffer.push(Lexeme::Word(quote_removal(word)));
-                    None
-                }
-                _ => {
-                    statement_buffer.push(lexeme);
-                    None
-                }
-            };
-            future::ready(output)
-        })
-        .map(|statement| {
-            println!("Statement {:?}", statement);
-            statement
-        })
-        .map(|statement| {
-            parse_statement(statement)
-        })
-        .for_each(|lexeme| future::ready(println!("{:?}", lexeme)))
-        .await;
+            }
+            _ => break,
+        }
+    }
+    if let Some(stmt) = builder.emit_statement() {
+        builder.output.unbounded_send(stmt).unwrap();
+    }
+
+    //job_stream
+    //    // Group by statements
+    //    .map(|lexeme| {
+    //        //println!("Lexeme {:?}", lexeme);
+    //        lexeme
+    //    })
+    //    .filter_map(|lexeme: Lexeme| {
+    //        future::ready(buffer.build(lexeme))
+    //    })
+    //    .for_each(|stmt| future::ready(println!("{:?}", stmt)))
+    //    .await;
 
     //while let Some(a) = stream.next().await {
     //    println!("{:?}", a);
@@ -99,7 +392,6 @@ struct QuoteWalk<'a> {
     iter_list: Vec<std::str::Chars<'a>>,
     iter_index: usize,
 }
-
 
 impl<'a> QuoteWalk<'a> {
     fn with_parts_capacity(source: &'a str, parts_capacity: usize) -> Self {
@@ -175,7 +467,6 @@ impl<'a> Iterator for QuoteWalk<'a> {
     }
 }
 
-
 // Same thing as `QuoteWalk.filter(|..| is_included)`, just with 'retain()'
 fn quote_removal(mut word: String) -> String {
     let mut state = QuoteState(NON_QUOTE, UNQUOTED);
@@ -191,7 +482,6 @@ fn quote_removal(mut word: String) -> String {
 #[cfg(test)]
 mod parser_helper_tests {
     use super::*;
-
 
     #[test]
     fn extendable_quote_walk() {
@@ -209,33 +499,36 @@ mod parser_helper_tests {
         let walk = QuoteWalk::with_parts_capacity(a.as_str(), 2)
             .walk_chain(b.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(walk, vec![
-            ('\'', false, false), // start has false for middle (is_quoted)
-            ('h', true, true),
-            ('\\', true, true),
-            ('a', true, true),
-            ('s', true, true),
-            ('\'', true, false),
-            ('b', false, true),
-            ('\\', false, false), // start has false for middle (is_quoted)
-            ('\\', true, true),
-            ('\\', false, false), // start has false for middle (is_quoted)
-            ('\'', true, true),
-            ('f', false, true),
-            ('"', false, false), // start has false for middle (is_quoted)
-            ('e', true, true),
-            ('n', true, true),
-            ('d', true, true),
-            ('\\', true, false), // true for middle because inside double quote
-            ('"', true, true),
-            ('q', true, true),
-            ('"', true, false),
-            (' ', false, true),
-            ('h', false, true),
-            ('e', false, true),
-            ('r', false, true),
-            ('e', false, true),
-            ('\\', false, true),
-        ]);
+        assert_eq!(
+            walk,
+            vec![
+                ('\'', false, false), // start has false for middle (is_quoted)
+                ('h', true, true),
+                ('\\', true, true),
+                ('a', true, true),
+                ('s', true, true),
+                ('\'', true, false),
+                ('b', false, true),
+                ('\\', false, false), // start has false for middle (is_quoted)
+                ('\\', true, true),
+                ('\\', false, false), // start has false for middle (is_quoted)
+                ('\'', true, true),
+                ('f', false, true),
+                ('"', false, false), // start has false for middle (is_quoted)
+                ('e', true, true),
+                ('n', true, true),
+                ('d', true, true),
+                ('\\', true, false), // true for middle because inside double quote
+                ('"', true, true),
+                ('q', true, true),
+                ('"', true, false),
+                (' ', false, true),
+                ('h', false, true),
+                ('e', false, true),
+                ('r', false, true),
+                ('e', false, true),
+                ('\\', false, true),
+            ]
+        );
     }
 }

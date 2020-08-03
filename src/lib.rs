@@ -67,20 +67,32 @@ echo "hello " bub
         println!("Token: {:?}", token);
     }
 
+    use parser::Statement;
+
     #[test]
     fn development() {
-        let input = r"sed 's/ *|//' ~/.environment/bookmarks.csv";
+        let input = r#"
+sed 's/ *|//' ~/.environment/bookmarks.csv
+echo $( cat me.adoc )
+        "#;
         let script_stream = stream::iter(vec![input]);
         let (lex_tx, lex_rx) = futures::channel::mpsc::unbounded::<Lexeme>();
+        let (code_tx, mut code_rx) = futures::channel::mpsc::unbounded::<Statement>();
 
         let lexer = task::spawn(job_stream_lex(script_stream, move |token| {
             // Currently no clue as to what are the costs/benefits for using
             // bounded vs unbounded mpsc, also 'unbounded_send()' vs 'send()'
             lex_tx.unbounded_send(token).unwrap();
         }));
-        let parser = task::spawn(job_stream_parse(lex_rx));
+        let parser = task::spawn(job_stream_parse(lex_rx, code_tx));
+        let runner = task::spawn(async move {
+            while let Some(stmt) = code_rx.next().await {
+                println!("Statement {:?}", stmt);
+            }
+
+        });
         task::block_on(async {
-            futures::join!(lexer, parser);
+            futures::join!(lexer, parser, runner);
         });
     }
 

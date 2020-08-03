@@ -1,9 +1,9 @@
 // @TODO echo `printf %s\\\n`  - figure out what should be done in this case
 
 // Dash is: git.kernel.org/pub/scm/utils/dash.git
+use crate::helpers::{OwnedToOption, TextGridWalk};
 use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
-use crate::helpers::{OwnedToOption, TextGridWalk};
 use std::collections::VecDeque;
 use std::mem::{discriminant, Discriminant};
 use std::ops::Range;
@@ -65,12 +65,12 @@ pub enum Lexeme {
     NewEnvCommand(String),
     SameEnvCommand(String),
 
-    ArithmeticStart,
-    ArithmeticClose,
-    SubShellStart,
-    SubShellClose,
-    ClosureStart,
-    ClosureClose,
+    ArithmeticStart(usize),
+    ArithmeticClose(usize),
+    SubShellStart(usize),
+    SubShellClose(usize),
+    ClosureStart(usize),
+    ClosureClose(usize),
     //
     HereDocStart,
     //HereDocClose,
@@ -86,6 +86,7 @@ pub enum Lexeme {
     OpAssign,
     Keyword(String),
 
+    Private(usize, usize),
     Debug(String),
 }
 
@@ -523,16 +524,20 @@ fn lexmode_backtick(
 
                         // Extra `+ 2` or one extra nesting from just plain '`'
                         if backslash_count + 2 == nest_depth {
-                            buffer.emit(Lexeme::SubShellStart);
-                            state
-                                .nesting
-                                .start(buffer, info, LexMode::Backtick);
+                            // Count depth before starting
+                            let id = nesting.depth_of(LexMode::Backtick);
+                            buffer.emit(Lexeme::SubShellStart(id));
+                            state.nesting.start(buffer, info, LexMode::Backtick);
+
                             temp.clear()
 
                         // Two more nestings (+ 4) (r"\\\`" is third level)
                         } else if backslash_count + 4 >= nest_depth {
-                            buffer.emit(Lexeme::SubShellClose);
+                            // Count depth after closing
                             nesting.close(LexMode::Backtick).unwrap();
+                            let id = nesting.depth_of(LexMode::Backtick);
+                            buffer.emit(Lexeme::SubShellClose(id));
+
                             temp.truncate(backslash_count + 4 - nest_depth);
                         } else {
                             panic!("mismatched backticks");
@@ -555,8 +560,12 @@ fn lexmode_backtick(
         Some((_, index, '`', _)) => {
             buffer.push_range(cursor.move_to(index));
             buffer.delimit();
+
+            // Count depth after closing
             nesting.close(LexMode::Backtick).unwrap();
-            buffer.emit(Lexeme::SubShellClose);
+            let id = nesting.depth_of(LexMode::Backtick);
+            buffer.emit(Lexeme::SubShellClose(id));
+
             cursor.move_to(index + '`'.len_utf8());
         }
 
@@ -642,8 +651,12 @@ fn lex_backtick(
     let after_backtick = walker.current_end_index();
     buffer.push_range(cursor.move_to(after_backtick - '`'.len_utf8()));
     buffer.delimit();
+
+    // Count depth before starting
+    let id = nesting.depth_of(LexMode::Backtick);
+    buffer.emit(Lexeme::SubShellStart(id));
     nesting.start(buffer, info, LexMode::Backtick);
-    buffer.emit(Lexeme::SubShellStart);
+
     cursor.move_to(after_backtick);
 }
 
@@ -660,16 +673,21 @@ fn lex_dollar(
 
         match peek_ch {
             '(' => {
-                walker.next(); // Skip '$'
+                walker.next(); // Skip '$' arriving at '$('
                 cursor.move_to(walker.current_end_index());
 
                 if let Some((_, _, '(', _)) = walker.peek() {
-                    walker.next();
+                    walker.next(); // Skipped '$(' arriving at '$(('
+
+                    // Count depth before starting
+                    let id = nesting.depth_of(LexMode::Arithmetic);
+                    buffer.emit(Lexeme::ArithmeticStart(id));
                     nesting.start(buffer, info, LexMode::Arithmetic);
-                    buffer.emit(Lexeme::ArithmeticStart);
                 } else {
+                    // Count depth before starting
+                    let id = nesting.depth_of(LexMode::Parenthesis);
+                    buffer.emit(Lexeme::SubShellStart(id));
                     nesting.start(buffer, info, LexMode::Parenthesis);
-                    buffer.emit(Lexeme::SubShellStart);
                 }
             }
 
@@ -724,7 +742,10 @@ fn lex_regular(
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
     LexemeBuilder {
-        buffer,nesting,heredoc_delim_list,..
+        buffer,
+        nesting,
+        heredoc_delim_list,
+        ..
     }: &mut LexemeBuilder,
     (rest_of_line, index, ch, info): <TextGridWalk as Iterator>::Item,
 ) {
@@ -823,16 +844,22 @@ fn lex_regular(
             match (nesting.current_type(), walker.peek()) {
                 (Some(LexMode::Arithmetic), Some((_, _, ')', _))) => {
                     cursor.move_to(index + "))".len());
-                    buffer.emit(Lexeme::ArithmeticClose);
+
+                    // Count depth after closing
                     nesting.close(LexMode::Arithmetic).unwrap();
+                    let id = nesting.depth_of(LexMode::Arithmetic);
+                    buffer.emit(Lexeme::ArithmeticClose(id));
                 }
                 (Some(LexMode::Arithmetic), _) => {
                     panic!("Hello");
                 }
                 (Some(LexMode::Parenthesis), _) => {
                     cursor.move_to(index + ')'.len_utf8());
-                    buffer.emit(Lexeme::SubShellClose);
+
+                    // Count depth after closing
                     nesting.close(LexMode::Parenthesis).unwrap();
+                    let id = nesting.depth_of(LexMode::Parenthesis);
+                    buffer.emit(Lexeme::SubShellClose(id));
                 }
                 (Some(_), _) => {
                     panic!("Unmatched parenthesis");
@@ -858,8 +885,7 @@ fn lex_regular(
                     }
                     let (delim, is_quoted) = walker.walk_to_heredoc_delim_end();
 
-                    heredoc_delim_list
-                        .push_back((delim, is_strip, is_quoted));
+                    heredoc_delim_list.push_back((delim, is_strip, is_quoted));
                     cursor.move_to(walker.peek_while(is_blank));
                     buffer.emit(Lexeme::OpInputHereDoc);
                 }
@@ -948,4 +974,3 @@ where
         file_lex(body, &mut emit);
     }
 }
-
