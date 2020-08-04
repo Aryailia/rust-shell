@@ -69,12 +69,15 @@ echo "hello " bub
 
     use parser::Statement;
 
-    #[test]
+    //#[test]
     fn development() {
         let input = r#"
 sed 's/ *|//' ~/.environment/bookmarks.csv
-echo $( cat me.adoc )
+echo "$( cat me.adoc )"
         "#;
+
+        println!("{}\n========", input);
+
         let script_stream = stream::iter(vec![input]);
         let (lex_tx, lex_rx) = futures::channel::mpsc::unbounded::<Lexeme>();
         let (code_tx, mut code_rx) = futures::channel::mpsc::unbounded::<Statement>();
@@ -96,12 +99,12 @@ echo $( cat me.adoc )
         });
     }
 
-    //#[test]
+    #[test]
     fn lexer_development() {
         //let (producer, consumer) = futures::channel::mpsc::unbounded::<Lexeme>();
 
         let mut token_list: Vec<Lexeme> = Vec::with_capacity(100);
-        let input = SCRIPT3;
+        let input = SCRIPT;
         let script_stream = stream::iter(vec![input]);
         task::block_on(async {
             println!("I am doing things\n====");
@@ -131,9 +134,8 @@ echo $( cat me.adoc )
             vec![
                 Lexeme::Comment("!/bin/ashell".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Word("main()".into()),
-                Lexeme::Separator,
-                Lexeme::Word("{".into()),
+                Lexeme::Function("main".into()),
+                Lexeme::Reserved("{".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::Comment(" yo".to_string()),
                 Lexeme::EndOfCommand,
@@ -153,7 +155,7 @@ echo $( cat me.adoc )
                 Lexeme::Separator,
                 Lexeme::Word("''".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Word("}".into()),
+                Lexeme::Reserved("}".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::Comment("".into()),
                 Lexeme::EndOfCommand,
