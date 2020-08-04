@@ -12,50 +12,13 @@ use std::process::{Command, Stdio};
 
 type ParserInput = UnboundedReceiver<Lexeme>;
 
-#[derive(Debug)]
-enum BuilderState {
-    Regular,
-    Word,
-}
-
+// The output type
 #[derive(Debug)]
 pub enum Statement {
     Assign,
     Label(usize),
     External(Executable),
     Debug(Vec<Lexeme>),
-}
-
-#[derive(Clone, Debug)]
-enum FileId {
-    Descriptor(usize),
-    Path(String),
-    Temp(usize, usize),
-    Piped,
-}
-
-//impl FileId {
-//    // @TODO Change to From<_>?
-//    //fn redirect<F: Fn(Into<Stdio>>)>(&self, handle: F) {
-//    //    //match self {
-//    //    //    FileId::Descriptor(0) => handle(io::stdin()),
-//    //    //    FileId::Descriptor(1) => handle(io::stdout()),
-//    //    //    FileId::Descriptor(2) => handle(io::stderr()),
-//    //    //    FileId::Descriptor(_) => todo!(),
-//    //    //    FileId::Path(_) => handle(Stdio::piped()),
-//    //    //    FileId::Piped => handle(Stdio::piped()),
-//    //    //}
-//    //}
-//}
-
-#[derive(Debug)]
-struct StatementBuilder {
-    output: UnboundedSender<Statement>,
-    nesting: ParserNesting,
-    mode: BuilderState,
-    buffer: Vec<Lexeme>,
-    label: usize,
-    current_handles: Option<IoHandles>,
 }
 
 //#[derive(Debug)]
@@ -108,6 +71,15 @@ impl Executable {
     //    //    FileId::Piped => cmd.stdin(Stdio::piped()),
     //    //};
     //}
+}
+
+// Representation of file descriptors
+#[derive(Clone, Debug)]
+enum FileId {
+    Descriptor(usize),
+    Path(String),
+    Temp(usize, usize),
+    Piped,
 }
 
 // @TODO @POSIX 2.7 Redirection says at least [0,9] shall be supported
@@ -179,13 +151,24 @@ impl ParserNesting {
     }
 }
 
+// The state for the FSM (Finite State Machine)
+#[derive(Debug)]
+struct StatementBuilder {
+    output: UnboundedSender<Statement>,
+    mode: BuilderState,
+
+    buffer: Vec<Lexeme>,
+    nesting: ParserNesting,
+    current_handles: Option<IoHandles>,
+    label: usize, // For loops and function calls
+}
+
 impl StatementBuilder {
     fn emit(&self, stmt: Statement)  {
         self.output.unbounded_send(stmt).unwrap();
     }
 
-
-    fn emit_statement(&mut self) -> Option<Statement> {
+    fn emit_statement(&mut self) {
         let len = self.buffer.len();
         let last_unnested_index = self.buffer
             .iter()
@@ -206,31 +189,26 @@ impl StatementBuilder {
         //    Some(Word
         //    None => None
         //}
-        if args.is_empty() {
-            None
-        } else {
+        if !args.is_empty() {
             //println!("{:?}\n", self.nesting);
-            //Some(Statement::Debug(args))
-            //let level = self.nesting.level;
-            //let id = self.nesting.var_id_stack[level];
-            //Some(Statement::External(Executable {
-            //    args,
-            //    stdin: self.stdin.replace_with_nesting_default(level, id),
-            //    stdout: self.stdout.replace_with_nesting_default(level, id),
-            //    stderr: self.stderr.replace_with_nesting_default(level, id),
-            //}))
-
             let handles = replace(&mut self.current_handles, None)
                 .unwrap_or_else(|| self.nesting.copy_current());
 
             self.current_handles = None;
-            Some(Statement::External(Executable {
+            self.output.unbounded_send(Statement::External(Executable {
                 args,
                 handles,
-            }))
+            })).unwrap()
 
         }
     }
+}
+
+// The possible modes for the FSM
+#[derive(Debug)]
+enum BuilderState {
+    Regular,
+    Word,
 }
 
 
@@ -238,24 +216,26 @@ impl StatementBuilder {
 //fn word_expand(word: String) -> String {
 //    QuoteWalker::with_parts_capacity(word.as_str(), 1)
 //}
+
+// The primary mode
 fn parse_regular(
     builder: &mut StatementBuilder,
     _stream: Pin<&mut Peekable<ParserInput>>,
     lexeme: Lexeme,
-) -> Option<Statement> {
+) {
     //println!("Lexeme {:?}", lexeme);
 
     match &lexeme {
-        Lexeme::Comment(_) => None,
+        Lexeme::Comment(_) => {}
+
         Lexeme::OpInputRedirect => {
-            None
         }
         Lexeme::EndOfCommand => {
             builder.nesting.reset();
             builder.emit_statement()
         }
         Lexeme::SubShellClose(_) | Lexeme::ClosureClose(_) => {
-            let stmt = builder.emit_statement();
+            builder.emit_statement();
             if let None = builder.buffer.pop() { // remove the starter
                 unreachable!("The lexer should catch unmatched parens");
             }
@@ -263,26 +243,61 @@ fn parse_regular(
 
             let handle = builder.nesting.close();
             builder.buffer.push(Lexeme::Private(handle.0, handle.1));
-
-            stmt
         }
-        Lexeme::Word(word) => {
-            match word.as_str() {
-                "for" => {}
-                _ => {}
-            }
+        Lexeme::Word(_) => {
             builder.buffer.push(lexeme);
-            None
         }
         Lexeme::SubShellStart(_) | Lexeme::ClosureStart(_) => {
             builder.nesting.start(builder.current_handles.clone());
             builder.buffer.push(lexeme); // Important for 'emit_statement()'
-            None
         }
-        _ => None,
+        _ => {}
     }
 }
 
+// The main parser command
+pub async fn job_stream_parse(input: ParserInput, output: UnboundedSender<Statement>) {
+    let input = &mut input.peekable();
+
+    let builder = &mut StatementBuilder {
+        output,
+        nesting: ParserNesting::new(),
+        mode: BuilderState::Regular,
+        buffer: Vec::new(),
+        label: 0,
+        current_handles: None,
+    };
+
+    loop {
+        match builder.mode {
+            BuilderState::Regular => {
+                if let Some(lexeme) = input.next().await {
+                    parse_regular(builder, Pin::new(input), lexeme);
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    builder.emit_statement();
+
+    //job_stream
+    //    // Group by statements
+    //    .map(|lexeme| {
+    //        //println!("Lexeme {:?}", lexeme);
+    //        lexeme
+    //    })
+    //    .filter_map(|lexeme: Lexeme| {
+    //        future::ready(buffer.build(lexeme))
+    //    })
+    //    .for_each(|stmt| future::ready(println!("{:?}", stmt)))
+    //    .await;
+
+    //while let Some(a) = stream.next().await {
+    //    println!("{:?}", a);
+    //}
+}
 //async fn peek_till_after_close(
 //    builder: &mut StatementBuilder,
 //    stream: Pin<&mut Peekable<ParserInput>>,
@@ -336,52 +351,6 @@ fn parse_regular(
 //    output
 //}
 
-pub async fn job_stream_parse(input: ParserInput, output: UnboundedSender<Statement>) {
-    let input = &mut input.peekable();
-
-    let builder = &mut StatementBuilder {
-        output,
-        nesting: ParserNesting::new(),
-        mode: BuilderState::Regular,
-        buffer: Vec::new(),
-        label: 0,
-        current_handles: None,
-    };
-
-    loop {
-        match builder.mode {
-            BuilderState::Regular => {
-                if let Some(lexeme) = input.next().await {
-                    if let Some(stmt) = parse_regular(builder, Pin::new(input), lexeme) {
-                        builder.output.unbounded_send(stmt).unwrap();
-                    }
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    if let Some(stmt) = builder.emit_statement() {
-        builder.output.unbounded_send(stmt).unwrap();
-    }
-
-    //job_stream
-    //    // Group by statements
-    //    .map(|lexeme| {
-    //        //println!("Lexeme {:?}", lexeme);
-    //        lexeme
-    //    })
-    //    .filter_map(|lexeme: Lexeme| {
-    //        future::ready(buffer.build(lexeme))
-    //    })
-    //    .for_each(|stmt| future::ready(println!("{:?}", stmt)))
-    //    .await;
-
-    //while let Some(a) = stream.next().await {
-    //    println!("{:?}", a);
-    //}
-}
 
 const NON_QUOTE: char = 0 as char;
 const UNQUOTED: bool = false;
