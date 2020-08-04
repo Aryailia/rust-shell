@@ -63,6 +63,7 @@ pub enum Lexeme {
     Separator,
     EndOfCommand,
     EndOfBackgroundCommand,
+    Break,
     Unprocessed(String),
     NewEnvCommand(String),
     SameEnvCommand(String),
@@ -78,17 +79,17 @@ pub enum Lexeme {
     //HereDocClose,
     EndOfFile,
     Variable(String),
+    Function(String),
 
     // List of Operators
     OpInputHereDoc,
     OpInputRedirect,
     OpOutputRedirect,
-    OpErrorRedirect,
     OpPipe,
     OpAssign,
     Keyword(String),
 
-    Private(usize, usize),
+    Private(usize, usize), // @TODO: Only for use in the parser
     Debug(String),
 }
 
@@ -101,7 +102,7 @@ type Info = (usize, usize);
 struct LexemeBuilder<'a> {
     //flags: Flag,
     buffer: LexemeBuffer<'a>,
-    nesting: NestingTracker,
+    nesting: LexNesting,
     heredoc_delim_list: HereDocDelimList,
 }
 
@@ -117,7 +118,7 @@ impl<'a> LexemeBuilder<'a> {
                 output_index: 0,
                 emitter: emitter,
             },
-            nesting: NestingTracker {
+            nesting: LexNesting {
                 stack: Vec::new(),
                 depth: [0; NEST_TOTAL_SIZE],
             },
@@ -201,12 +202,13 @@ impl<'a> LexemeBuffer<'a> {
 }
 
 // Basically the state changer for the finite state machine
-struct NestingTracker {
+#[derive(Debug)]
+struct LexNesting {
     stack: Vec<(LexMode, Info)>,
     depth: [usize; NEST_TOTAL_SIZE],
 }
 
-impl NestingTracker {
+impl LexNesting {
     fn start(&mut self, buffer: &mut LexemeBuffer, val: Info, nest_type: LexMode) {
         self.depth[nest_type.clone() as usize] += 1;
         self.stack.push((nest_type, val));
@@ -647,7 +649,7 @@ fn lex_backtick(
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
     buffer: &mut LexemeBuffer,
-    nesting: &mut NestingTracker,
+    nesting: &mut LexNesting,
     info: Info,
 ) {
     let after_backtick = walker.current_end_index();
@@ -666,7 +668,7 @@ fn lex_dollar(
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
     buffer: &mut LexemeBuffer,
-    nesting: &mut NestingTracker,
+    nesting: &mut LexNesting,
     info: Info,
 ) {
     if let Some((_, peek_index, peek_ch, _)) = walker.peek() {
@@ -833,10 +835,17 @@ fn lex_regular(
             buffer.push_range(cursor.move_to(index));
             buffer.delimit();
             if let Some((_, _, ';', _)) = walker.peek() {
-                buffer.emit(Lexeme::Debug("Break".into()));
+                walker.next();
+                buffer.emit(Lexeme::Break);
             } else {
                 lex_command_end_and_eat_whitespace(walker, cursor, buffer, Lexeme::EndOfCommand);
             }
+        }
+
+        '|' => {
+            buffer.push_range(cursor.move_to(index));
+            buffer.delimit();
+            lex_command_end_and_eat_whitespace(walker, cursor, buffer, Lexeme::OpPipe);
         }
 
         ')' if nesting.depth_of(LexMode::Parenthesis) > 0 => {
@@ -869,6 +878,35 @@ fn lex_regular(
                 (None, _) => {
                     panic!("Unexpected parenthesis");
                 }
+            }
+        }
+        ')' => {
+            panic!("Unmatched parenthesis");
+        }
+
+        '(' => {
+            let name = &buffer.source[cursor.span(index)];
+
+            if !buffer.is_first_lexeme() {
+                panic!("'(' cannot be passed as parameter unquoted. Use '$(' if you want a string. If intended to be a command grouping, put on newline or delimit with ';', '&', '|', etc.");
+            } else if name.is_empty() {
+                buffer.push_range(cursor.move_to(index));
+                buffer.delimit();
+                cursor.move_to(index + '('.len_utf8());
+
+                let id = nesting.depth_of(LexMode::Parenthesis);
+                buffer.emit(Lexeme::SubShellStart(id));
+                nesting.start(buffer, info, LexMode::Parenthesis);
+            } else if find_valid_variable_name(name) == name.len() {
+                if let Some((_, _, ')', _)) = walker.peek() {
+                    walker.next(); // Skip '('
+                    cursor.move_to(index + "()".len());
+                    buffer.emit(Lexeme::Function(name.into()));
+                } else {
+                    panic!("Expecting function decleration '{}()'", name);
+                }
+            } else {
+                panic!("Invalid function name {:?}", name);
             }
         }
 
