@@ -7,11 +7,14 @@ mod helpers;
 mod lexer;
 mod parser;
 mod model;
+mod run;
 
-use async_std::task;
-use futures::{stream, stream::Stream, StreamExt};
 use lexer::job_stream_lex;
 use parser::job_stream_parse;
+use run::job_stream_run;
+
+use async_std::task;
+use futures::{stream, stream::Stream, StreamExt, channel::mpsc};
 
 #[cfg(test)]
 mod shell_tests {
@@ -82,8 +85,8 @@ a=hello
         println!("{}\n========", input);
 
         let script_stream = stream::iter(vec![input]);
-        let (lex_tx, lex_rx) = futures::channel::mpsc::unbounded::<Lexeme>();
-        let (code_tx, mut code_rx) = futures::channel::mpsc::unbounded::<Parseme>();
+        let (lex_tx, lex_rx) = mpsc::unbounded::<Lexeme>();
+        let (code_tx, code_rx) = mpsc::unbounded::<Parseme>();
 
         let lexer = task::spawn(job_stream_lex(script_stream, move |token| {
             //println!("Lexeme::{:?}", token);
@@ -93,12 +96,13 @@ a=hello
             lex_tx.unbounded_send(token).unwrap();
         }));
         let parser = task::spawn(job_stream_parse(lex_rx, code_tx));
-        let runner = task::spawn(async move {
-            while let Some(stmt) = code_rx.next().await {
-                println!("Parseme {:?}", stmt);
-            }
+        let runner = task::spawn(job_stream_run(code_rx));
+        //let runner = task::spawn(async move {
+        //    while let Some(stmt) = code_rx.next().await {
+        //        println!("Parseme {:?}", stmt);
+        //    }
 
-        });
+        //});
         task::block_on(async {
             futures::join!(lexer, parser, runner);
         });
