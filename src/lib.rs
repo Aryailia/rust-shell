@@ -6,10 +6,11 @@
 mod helpers;
 mod lexer;
 mod parser;
+mod model;
 
 use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
-use lexer::{job_stream_lex, Lexeme};
+use lexer::job_stream_lex;
 use parser::job_stream_parse;
 
 #[cfg(test)]
@@ -67,7 +68,7 @@ echo "hello " bub
         println!("Token: {:?}", token);
     }
 
-    use parser::Statement;
+    use crate::model::{Parseme, Lexeme};
 
     #[test]
     fn development() {
@@ -82,7 +83,7 @@ a=hello
 
         let script_stream = stream::iter(vec![input]);
         let (lex_tx, lex_rx) = futures::channel::mpsc::unbounded::<Lexeme>();
-        let (code_tx, mut code_rx) = futures::channel::mpsc::unbounded::<Statement>();
+        let (code_tx, mut code_rx) = futures::channel::mpsc::unbounded::<Parseme>();
 
         let lexer = task::spawn(job_stream_lex(script_stream, move |token| {
             //println!("Lexeme::{:?}", token);
@@ -94,7 +95,7 @@ a=hello
         let parser = task::spawn(job_stream_parse(lex_rx, code_tx));
         let runner = task::spawn(async move {
             while let Some(stmt) = code_rx.next().await {
-                println!("Statement {:?}", stmt);
+                println!("Parseme {:?}", stmt);
             }
 
         });

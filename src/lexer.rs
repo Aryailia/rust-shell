@@ -4,6 +4,8 @@
 
 // Dash is: git.kernel.org/pub/scm/utils/dash.git
 use crate::helpers::{OwnedToOption, TextGridWalk};
+use crate::model::Lexeme;
+
 use async_std::task;
 use futures::{stream, stream::Stream, StreamExt};
 use std::collections::VecDeque;
@@ -54,49 +56,12 @@ enum LexMode {
 }
 const NEST_TOTAL_SIZE: usize = 8; // @VOLATILE: 'LexMode' final discriminant + 1
 
-// @TODO change to Cow<str> or &str if possible for later stages
-#[derive(Clone, Debug, PartialEq)]
-pub enum Lexeme {
-    Reserved(String),
-    Text(String), // 'Text(..)' is parts of 'words' as defined in @POSIX 2
-    Comment(String),
-    Separator,
-
-    // These cause 'output_index' and 'args_consumed' to reset to zero
-    EndOfCommand,
-    Pipe,
-    EndOfBackgroundCommand,
-    Break,
-    Function(String),
-
-    // Variables
-    Variable(String),
-    Private(usize, usize), // @TODO: Only for use in the parser
-
-    // These deal with nesting
-    ArithmeticStart(usize),
-    ArithmeticClose(usize),
-    SubShellStart(usize),
-    SubShellClose(usize),
-    ClosureStart(usize),
-    ClosureClose(usize),
-    HereDocStart,
-    EndOfFile,
-
-    OpInputHereDoc,
-    OpInput,
-    OpOutput,
-    OpAssign,
-
-    Debug(String),
-}
-
 // Token, Strip Tabs?, Quoted Delim?
 type HereDocDelimList = VecDeque<(String, bool, bool)>;
 type Info = (usize, usize);
 
 // Need one per file source processed
-// In charge of
+// Finite state machine
 struct LexemeBuilder<'a> {
     //flags: Flag,
     buffer: LexemeBuffer<'a>,
