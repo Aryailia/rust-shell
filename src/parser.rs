@@ -95,9 +95,7 @@ impl ParsemeBuilder {
             .iter()
             .rev()
             .position(|lexeme| match lexeme {
-                Lexeme::ArithmeticStart(_) | Lexeme::SubShellStart(_) | Lexeme::ClosureStart(_) => {
-                    true
-                }
+                Lexeme::ArithmeticStart | Lexeme::SubShellStart | Lexeme::ClosureStart => true,
                 _ => false,
             })
             .map(|reverse_index| len - reverse_index)
@@ -131,11 +129,11 @@ fn parse_regular(builder: &mut ParsemeBuilder, lexeme: Lexeme) {
     match &lexeme {
         Lexeme::Comment(_) => {}
 
-        Lexeme::SubShellStart(_) => {
+        Lexeme::SubShellStart => {
             builder.nesting.start(ParseMode::Scoped, None);
             builder.buffer.push(lexeme); // Important for 'emit_parseme()'
         }
-        Lexeme::SubShellClose(_) | Lexeme::ClosureClose(_) => {
+        Lexeme::SubShellClose | Lexeme::ClosureClose => {
             builder.emit_parseme();
             if let None = builder.buffer.pop() {
                 // remove the starter
@@ -241,7 +239,7 @@ async fn parsemode_next_word(
             _ if lexeme_type == discriminant(&Lexeme::OpInputHereDoc) => {
                 todo!();
             }
-            Lexeme::ArithmeticStart(_) | Lexeme::SubShellStart(_) | Lexeme::ClosureStart(_) => {
+            Lexeme::ArithmeticStart | Lexeme::SubShellStart | Lexeme::ClosureStart => {
                 let lexeme = stream.as_mut().next().await.expect("never none");
                 parse_regular(builder, lexeme);
                 break; // resume the current nesting

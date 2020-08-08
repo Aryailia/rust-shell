@@ -142,17 +142,29 @@ impl<'a> LexemeBuffer<'a> {
             // @POSIX 2.10.2 (Step 1) Shell Grammar Rules
             // @TODO: Reserved words cannot have quotes
             // @TODO: benchmark if this is faster than .take()
-            let is_reserved = match self.buffer.as_str() {
-                _ if self.args_consumed != self.output_index => false,
-                "!" | "{" | "}" | "case" | "do" | "done" | "elif" | "else" | "esac" | "fi"
-                | "for" | "if" | "in" | "then" | "until" | "while" => true,
-                _ => false,
+            let lexeme = match self.buffer.as_str() {
+                _ if self.args_consumed != self.output_index => {
+                    Lexeme::Text(self.buffer.clone())
+                }
+                //"!" => Lexeme::ReservedExclamation,
+                "{" => Lexeme::ClosureStart, // @TODO: Figure out if this should interact with nesting feature
+                "}"=> Lexeme::ClosureClose,
+                "case" => Lexeme::Case,
+                "do" => Lexeme::Do,
+                "done" => Lexeme::Done,
+                "elif" => Lexeme::ElseIf,
+                "else" => Lexeme::Else,
+                "esac" => Lexeme::Esac,
+                "fi" => Lexeme::EndIf,
+                "for" => Lexeme::For,
+                "if" => Lexeme::If,
+                //"in" => Lexeme::In,
+                "then" => Lexeme::Then,
+                "until" => Lexeme::Until,
+                "while" => Lexeme::While,
+                _ => Lexeme::Text(self.buffer.clone()),
             };
-            if is_reserved {
-                (self.emitter)(Lexeme::Reserved(self.buffer.clone()));
-            } else {
-                (self.emitter)(Lexeme::Text(self.buffer.clone()));
-            }
+            (self.emitter)(lexeme);
             self.buffer.clear();
             self.output_index += 1;
         }
@@ -511,16 +523,14 @@ fn lexmode_backtick(
                         if backslash_count + 2 == nest_depth {
                             // 'start()' before 'emit()' start lexeme
                             nesting.start(buffer, info, LexMode::Backtick);
-                            let id = nesting.depth_of(LexMode::Backtick);
-                            buffer.emit(Lexeme::SubShellStart(id));
+                            buffer.emit(Lexeme::SubShellStart);
 
                             temp.clear()
 
                         // Two more nestings (+ 4) (r"\\\`" is third level)
                         } else if backslash_count + 4 >= nest_depth {
                             // Count depth after closing
-                            let id = nesting.depth_of(LexMode::Backtick);
-                            buffer.emit(Lexeme::SubShellClose(id));
+                            buffer.emit(Lexeme::SubShellClose);
                             nesting.close(buffer, LexMode::Backtick).unwrap();
 
                             temp.truncate(backslash_count + 4 - nest_depth);
@@ -546,11 +556,8 @@ fn lexmode_backtick(
             buffer.push_range(cursor.move_to(index));
             buffer.delimit();
 
-            // Count depth after closing
-            let id = nesting.depth_of(LexMode::Backtick);
-            buffer.emit(Lexeme::SubShellClose(id));
-
             cursor.move_to(index + '`'.len_utf8());
+            buffer.emit(Lexeme::SubShellClose);
             nesting.close(buffer, LexMode::Backtick).unwrap();
         }
 
@@ -641,11 +648,8 @@ fn lex_backtick(
     buffer.push_range(cursor.move_to(after_backtick - '`'.len_utf8()));
     buffer.delimit();
 
-    // 'start()' before 'emit()' start lexeme
     nesting.start(buffer, info, LexMode::Backtick);
-    let id = nesting.depth_of(LexMode::Backtick);
-    buffer.emit(Lexeme::SubShellStart(id));
-
+    buffer.emit(Lexeme::SubShellStart);
     cursor.move_to(after_backtick);
 }
 
@@ -663,21 +667,19 @@ fn lex_dollar(
         match peek_ch {
             '(' => {
                 walker.next(); // Skip '$' arriving at '$('
-                cursor.move_to(walker.current_end_index());
 
                 if let Some((_, _, '(', _)) = walker.peek() {
                     walker.next(); // Skipped '$(' arriving at '$(('
-
-                    // 'start()' before 'emit()' start lexeme
+                    cursor.move_to(walker.current_end_index());
                     nesting.start(buffer, info, LexMode::Arithmetic);
-                    let id = nesting.depth_of(LexMode::Arithmetic);
-                    buffer.emit(Lexeme::ArithmeticStart(id));
+                    buffer.emit(Lexeme::ArithmeticStart);
                 } else {
-                    // 'start()' before 'emit()' start lexeme
+                    cursor.move_to(walker.current_end_index());
                     nesting.start(buffer, info, LexMode::Parenthesis);
-                    let id = nesting.depth_of(LexMode::Parenthesis);
-                    buffer.emit(Lexeme::SubShellStart(id));
+                    buffer.emit(Lexeme::SubShellStart);
                 }
+
+                // Move to after either '$(' or '$(('
             }
 
             '{' => {
@@ -728,6 +730,14 @@ fn lex_command_end(
     cursor.move_to(non_blank);
 }
 
+
+// 'lexmode_*()' functions repsent a state in the FSM. They will run
+//    'walker.next()' by themselves.
+// 'lex_*'() are intended to lex a single char in the input String
+//
+// In general, we do not 'buffer.delimit()' to ever initiate a 'nesting.start()'
+// This is because 'nesting.start()' changes state, thus we would need to
+// peek()
 fn lex_regular(
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
@@ -838,8 +848,7 @@ fn lex_regular(
                     cursor.move_to(index + "))".len());
 
                     // Putting 'close()' after 'emit()' so must `- 1`
-                    let id = nesting.depth_of(LexMode::Arithmetic);
-                    buffer.emit(Lexeme::ArithmeticClose(id));
+                    buffer.emit(Lexeme::ArithmeticClose);
                     nesting.close(buffer, LexMode::Arithmetic).unwrap();
                 }
                 (Some(LexMode::Arithmetic), _) => {
@@ -847,10 +856,7 @@ fn lex_regular(
                 }
                 (Some(LexMode::Parenthesis), _) => {
                     cursor.move_to(index + ')'.len_utf8());
-
-                    // Putting 'close()' after 'emit()' so must `- 1`
-                    let id = nesting.depth_of(LexMode::Parenthesis);
-                    buffer.emit(Lexeme::SubShellClose(id));
+                    buffer.emit(Lexeme::SubShellClose);
                     nesting.close(buffer, LexMode::Parenthesis).unwrap();
                 }
                 (Some(_), _) => {
@@ -877,8 +883,7 @@ fn lex_regular(
 
                 // 'start()' before 'emit()' start lexeme
                 nesting.start(buffer, info, LexMode::Parenthesis);
-                let id = nesting.depth_of(LexMode::Parenthesis);
-                buffer.emit(Lexeme::SubShellStart(id));
+                buffer.emit(Lexeme::SubShellStart);
             } else if find_valid_variable_name(name) == name.len() {
                 if let Some((_, _, ')', _)) = walker.peek() {
                     walker.next(); // Skip '('

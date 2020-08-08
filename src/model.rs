@@ -1,7 +1,6 @@
 // @TODO change to Cow<str> or &str if possible for later stages
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lexeme {
-    Reserved(String),
     Text(String), // 'Text(..)' is parts of 'words' as defined in @POSIX 2
     Comment(String),
     Separator,
@@ -18,12 +17,12 @@ pub enum Lexeme {
     Private(usize, usize), // @TODO: Only for use in the parser
 
     // These deal with nesting
-    ArithmeticStart(usize),
-    ArithmeticClose(usize),
-    SubShellStart(usize),
-    SubShellClose(usize),
-    ClosureStart(usize),
-    ClosureClose(usize),
+    ArithmeticStart,
+    ArithmeticClose,
+    SubShellStart,
+    SubShellClose,
+    ClosureStart,
+    ClosureClose,
     HereDocStart,
     EndOfFile,
 
@@ -31,6 +30,21 @@ pub enum Lexeme {
     OpInput,
     OpOutput,
     OpAssign,
+
+    // Reserved words
+    Case,
+    Do,
+    Done,
+    ElseIf,
+    Else,
+    Esac,
+    EndIf,
+    For,
+    If,
+    In,
+    Then,
+    Until,
+    While,
 
     Debug(String),
 }
@@ -78,23 +92,6 @@ impl std::fmt::Debug for Executable {
             },
         )
     }
-}
-
-impl Executable {
-    // @TODO Change to From<_>?
-    //fn run(&self) {
-    //    let mut args = self.args.iter();
-    //    let mut cmd = Command::new(args.next().unwrap());
-    //    cmd.args(args);
-    //    //match &self.stdin {
-    //    //    FileId::Descriptor(0) => cmd.stdin(io::stdin()),
-    //    //    FileId::Descriptor(1) => cmd.stdin(io::stdout()),
-    //    //    FileId::Descriptor(2) => cmd.stdin(io::stderr()),
-    //    //    FileId::Descriptor(_) => &mut cmd,
-    //    //    FileId::Path(_) => cmd.stdin(Stdio::piped()),
-    //    //    FileId::Piped => cmd.stdin(Stdio::piped()),
-    //    //};
-    //}
 }
 
 // Representation of file descriptors
