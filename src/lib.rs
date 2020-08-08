@@ -69,11 +69,13 @@ echo "hello " bub
 
     use parser::Statement;
 
-    //#[test]
+    #[test]
     fn development() {
         let input = r#"
 sed 's/ *|//' ~/.environment/bookmarks.csv
 echo "$( cat me.adoc )"
+a=hello
+<hello cat -
         "#;
 
         println!("{}\n========", input);
@@ -83,6 +85,8 @@ echo "$( cat me.adoc )"
         let (code_tx, mut code_rx) = futures::channel::mpsc::unbounded::<Statement>();
 
         let lexer = task::spawn(job_stream_lex(script_stream, move |token| {
+            //println!("Lexeme::{:?}", token);
+
             // Currently no clue as to what are the costs/benefits for using
             // bounded vs unbounded mpsc, also 'unbounded_send()' vs 'send()'
             lex_tx.unbounded_send(token).unwrap();
@@ -99,7 +103,7 @@ echo "$( cat me.adoc )"
         });
     }
 
-    #[test]
+    //#[test]
     fn lexer_development() {
         //let (producer, consumer) = futures::channel::mpsc::unbounded::<Lexeme>();
 
@@ -141,19 +145,19 @@ echo "$( cat me.adoc )"
                 Lexeme::EndOfCommand,
                 Lexeme::Variable("asdf".into()),
                 Lexeme::OpAssign,
-                Lexeme::Word("'hello'".into()),
+                Lexeme::Text("'hello'".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Word("printf".into()),
+                Lexeme::Text("printf".into()),
                 Lexeme::Separator,
-                Lexeme::Word(r"%s\\n".into()),
+                Lexeme::Text(r"%s\\n".into()),
                 Lexeme::Separator,
                 Lexeme::Variable("asdf".into()),
                 Lexeme::EndOfCommand,
-                Lexeme::Word("echo".into()),
+                Lexeme::Text("echo".into()),
                 Lexeme::Separator,
-                Lexeme::Word("''".into()),
+                Lexeme::Text("''".into()),
                 Lexeme::Separator,
-                Lexeme::Word("''".into()),
+                Lexeme::Text("''".into()),
                 Lexeme::EndOfCommand,
                 Lexeme::Reserved("}".into()),
                 Lexeme::EndOfCommand,

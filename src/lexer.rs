@@ -55,12 +55,11 @@ enum LexMode {
 const NEST_TOTAL_SIZE: usize = 8; // @VOLATILE: 'LexMode' final discriminant + 1
 
 // @TODO change to Cow<str> or &str if possible for later stages
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Lexeme {
     Reserved(String),
-    Word(String), // 'Words' as defined in "2. Shell Command Language"
+    Text(String), // 'Text(..)' is parts of 'words' as defined in @POSIX 2
     Comment(String),
-    CommentStart, // Might remove this in favour of just Comment
     Separator,
 
     // These cause 'output_index' and 'args_consumed' to reset to zero
@@ -85,8 +84,8 @@ pub enum Lexeme {
     EndOfFile,
 
     OpInputHereDoc,
-    OpInputRedirect,
-    OpOutputRedirect,
+    OpInput,
+    OpOutput,
     OpAssign,
 
     Debug(String),
@@ -187,7 +186,7 @@ impl<'a> LexemeBuffer<'a> {
             if is_reserved {
                 (self.emitter)(Lexeme::Reserved(self.buffer.clone()));
             } else {
-                (self.emitter)(Lexeme::Word(self.buffer.clone()));
+                (self.emitter)(Lexeme::Text(self.buffer.clone()));
             }
             self.buffer.clear();
             self.output_index += 1;
@@ -953,7 +952,7 @@ fn lex_regular(
                 }
                 _ => {
                     cursor.move_to(index + "<".len());
-                    buffer.emit(Lexeme::OpInputRedirect);
+                    buffer.emit(Lexeme::OpInput);
                     buffer.args_consumed += 2; // OpInput and the word after
                 }
             }
@@ -968,7 +967,7 @@ fn lex_regular(
                 cursor.move_to(index + '='.len_utf8());
                 buffer.emit(Lexeme::OpAssign);
                 buffer.args_consumed += 2; // Variable and OpAssign
-            } // else is just plaintext to be lexed as 'Lexeme::Word'
+            } // else is just plaintext to be lexed as 'Lexeme::Text'
         }
 
         '#' if buffer.is_empty() => {
