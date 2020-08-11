@@ -1,6 +1,6 @@
 //run: cargo test shell_tests -- --nocapture
 
-use crate::model::{Lexeme, Parseme, IoHandles, FileId, Executable};
+use crate::model::{Executable, FileId, IoHandles, Lexeme, Parseme};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::stream::{Peekable, Stream};
@@ -17,6 +17,7 @@ type ParserInput = UnboundedReceiver<Lexeme>;
 #[derive(Debug)]
 struct ParserNesting {
     level: usize,
+    label_index: usize,
 
     // Number of temporary values needed (0-indexed), handles for the nesting
     stack: Vec<(usize, IoHandles, ParseMode)>,
@@ -27,6 +28,7 @@ impl ParserNesting {
             level: 0, // The lengths of the below should = `level + 1`
             // Keeping track of the IO handles for each nesting
             stack: vec![(0, IoHandles::new(), ParseMode::Regular)],
+            label_index: 0,
         }
     }
     fn start(&mut self, mode: ParseMode, redirected_handles: Option<IoHandles>) {
@@ -95,19 +97,18 @@ impl ParsemeBuilder {
             .iter()
             .rev()
             .position(|lexeme| match lexeme {
-                Lexeme::ArithmeticStart | Lexeme::SubShellStart | Lexeme::ClosureStart => true,
+                Lexeme::ArithmeticStart
+                | Lexeme::SubShellStart
+                | Lexeme::ClosureStart
+                | Lexeme::If
+                | Lexeme::While
+                | Lexeme::Until => true,
                 _ => false,
             })
             .map(|reverse_index| len - reverse_index)
             .unwrap_or(0);
 
         let args = buffer.split_off(last_unnested_index);
-
-        //println!("buffer {:?} {:?}", find_nest_start_index, self.buffer);
-        //match args.first() {
-        //    Some(Word
-        //    None => None
-        //}
         if !args.is_empty() {
             let handles = replace(command_handles, nesting.copy_current());
 
@@ -125,13 +126,16 @@ impl ParsemeBuilder {
 // This is intentionally not async, parsing one lexeme at a time
 // For relational lexemes (requires more than on lexeme to have meaning), we
 // change states for our parser FSM ('parsemode_*')
-fn parse_regular(builder: &mut ParsemeBuilder, lexeme: Lexeme) {
+// True if opens a nesting
+fn parse_regular(builder: &mut ParsemeBuilder, lexeme: Lexeme) -> bool {
+    // @TODO This should be exhaustive to catch all errors
     match &lexeme {
-        Lexeme::Comment(_) => {}
+        Lexeme::Comment(_) => false,
 
         Lexeme::SubShellStart => {
             builder.nesting.start(ParseMode::Scoped, None);
             builder.buffer.push(lexeme); // Important for 'emit_parseme()'
+            true
         }
         Lexeme::SubShellClose | Lexeme::ClosureClose => {
             builder.emit_parseme();
@@ -142,6 +146,7 @@ fn parse_regular(builder: &mut ParsemeBuilder, lexeme: Lexeme) {
 
             let handle = builder.nesting.close();
             builder.buffer.push(Lexeme::Private(handle.0, handle.1));
+            false
         }
 
         Lexeme::OpAssign => {
@@ -151,25 +156,116 @@ fn parse_regular(builder: &mut ParsemeBuilder, lexeme: Lexeme) {
                 // This should be ensured by the lexer
                 unreachable!("'=' did not find a variable");
             }
+            false
         }
 
         Lexeme::OpInput | Lexeme::OpOutput | Lexeme::OpInputHereDoc => {
             let len = builder.buffer.len();
             let switch_to = ParseMode::NextWord(lexeme, len);
             builder.nesting.start(switch_to, None);
+            true
+        }
+        Lexeme::While => {
+            builder.nesting.start(ParseMode::ControlFlow(lexeme), None);
+            true
         }
 
-        Lexeme::Separator => {}
+        Lexeme::Separator => false,
 
         Lexeme::EndOfCommand => {
             builder.nesting.reset();
-            builder.emit_parseme()
+            builder.emit_parseme();
+            false
         }
         Lexeme::Text(_) => {
             builder.buffer.push(lexeme);
+            false
         }
-        _ => builder.buffer.push(lexeme),
+        _ => {
+            builder.buffer.push(lexeme);
+            false
+        }
     }
+}
+
+//async fn parsemode_then() {
+//    while let Some(lexeme) = stream.as_mut().next().await {
+//        let triggered_state_change = if let Lexeme::ElseIf = lexeme {
+//        } else if let Lexeme::Fi = lexeme {
+//        } else {
+//            parse_regular(builder, lexeme)
+//        };
+//
+//        if triggered_state_change {
+//            return true;
+//        }
+//    }
+//}
+//
+async fn parsemode_do(
+    builder: &mut ParsemeBuilder,
+    mut stream: Pin<&mut Peekable<ParserInput>>,
+) -> bool {
+    while let Some(lexeme) = stream.as_mut().next().await {
+        if let Lexeme::Done = &lexeme {
+            builder.nesting.close();
+            return true;
+        } else {
+            parse_regular(builder, lexeme);
+        }
+    }
+    false
+}
+
+//
+async fn parsemode_control_sentinel(
+    builder: &mut ParsemeBuilder,
+    mut stream: Pin<&mut Peekable<ParserInput>>,
+    starter_token: Discriminant<Lexeme>,
+) -> bool {
+    // Parse until 'Lexeme::EndOfCommand'
+    while let Some(lexeme) = stream.as_mut().next().await {
+        if let Lexeme::EndOfCommand = &lexeme {
+            builder.emit(Parseme::Label(builder.nesting.label_index, 0));
+            parse_regular(builder, lexeme);
+
+            builder.nesting.close();
+            let mode = match stream.as_mut().peek().await {
+                Some(&Lexeme::Do)
+                    if starter_token == discriminant(&Lexeme::While)
+                        || starter_token == discriminant(&Lexeme::Until) =>
+                {
+                    ParseMode::ControlBody(Lexeme::Do)
+                }
+                Some(&Lexeme::Then)
+                    if starter_token == discriminant(&Lexeme::If)
+                        || starter_token == discriminant(&Lexeme::ElseIf) =>
+                {
+                    ParseMode::ControlBody(Lexeme::Then)
+                }
+                peek_token => panic!("Bad control flow, unexpected token: {:?}", peek_token),
+            };
+            builder.nesting.start(mode, None);
+            stream.as_mut().next().await; // Skip 'do' / 'then'
+            return true;
+        } else {
+            parse_regular(builder, lexeme);
+        }
+    }
+
+    //    }
+    //    if starter_token == discriminant(&Lexeme::EndOfCommand) {
+    //        parse_regular(builder, lexeme)
+    //        if let Some(Lexeme::Do) = stream.as_mut().peek().await {
+    //            stream.as_mut().next().await.unwrap();
+    //        } else {
+    //            panic!("Invalid")
+    //        }
+    //    //} else if {
+    //    } else {
+    //        parse_regular(builder, lexeme);
+    //    }
+    false
 }
 
 // The possible modes for the FSM
@@ -178,6 +274,8 @@ enum ParseMode {
     Regular,
     Scoped,
     NextWord(Lexeme, usize),
+    ControlFlow(Lexeme),
+    ControlBody(Lexeme),
 }
 
 // The main parser command
@@ -204,21 +302,35 @@ pub async fn job_stream_parse(input: ParserInput, output: UnboundedSender<Parsem
         // Doing a FSM-type approach avoids recursion
         // 'parsemode_next_word()' calls parse_regular
         // async recursion requires 'Box<..>'
-        match builder.nesting.current_mode() {
+        let is_continue = match builder.nesting.current_mode() {
             ParseMode::Regular | ParseMode::Scoped => {
                 if let Some(lexeme) = input.as_mut().next().await {
                     parse_regular(builder, lexeme);
+                    true
                 } else {
-                    break;
+                    false
                 }
+            }
+            ParseMode::ControlBody(Lexeme::Do) => {
+                parsemode_do(builder, input.as_mut()).await
+            }
+            ParseMode::ControlFlow(lexeme_ref) => {
+                let control_type = discriminant(lexeme_ref);
+                parsemode_control_sentinel(builder, input.as_mut(), control_type).await
             }
             ParseMode::NextWord(lexeme_ref, len) => {
                 // Rustc complains if not on separate line
                 let len_at_start = *len;
                 let type_at_start = discriminant(lexeme_ref);
 
-                parsemode_next_word(builder, input.as_mut(), len_at_start, type_at_start).await;
-            } //mode => unreachable!("Parser FSM state: {:?}", mode),
+                parsemode_next_word(builder, input.as_mut(), len_at_start, type_at_start).await
+            }
+
+            mode => todo!("Parser FSM state: {:?}", mode),
+        };
+
+        if !is_continue {
+            break;
         }
     }
     builder.emit_parseme();
@@ -229,7 +341,7 @@ async fn parsemode_next_word(
     mut stream: Pin<&mut Peekable<ParserInput>>,
     start_len: usize,
     lexeme_type: Discriminant<Lexeme>,
-) {
+) -> bool {
     while let Some(peek_ref) = stream.as_mut().peek().await {
         match peek_ref {
             Lexeme::Text(_) | Lexeme::Variable(_) => {
@@ -242,7 +354,7 @@ async fn parsemode_next_word(
             Lexeme::ArithmeticStart | Lexeme::SubShellStart | Lexeme::ClosureStart => {
                 let lexeme = stream.as_mut().next().await.expect("never none");
                 parse_regular(builder, lexeme);
-                break; // resume the current nesting
+                return true; // resume the current nesting
             }
 
             // In particular, 'Lexeme::Separator' will break here
@@ -260,12 +372,12 @@ async fn parsemode_next_word(
                     unreachable!("Should never reach this: {:?}", lexeme_type);
                 }
 
-                break;
+                return true;
             }
         }
     }
+    false
 }
-
 
 ////////////////////////////////////////////////////////////////////////////////
 // Probably axing this stuff or moving to run step

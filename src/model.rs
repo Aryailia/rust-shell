@@ -52,7 +52,10 @@ pub enum Lexeme {
 #[derive(Debug)]
 pub enum Parseme {
     Assign,
-    Label(usize),
+    Label(usize, usize),
+    JumpIfFalse(usize, usize),
+    JumpIfTrue(usize, usize),
+    Jump(usize, usize),
     External(Executable),
     Debug(Vec<Lexeme>),
 }
