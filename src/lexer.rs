@@ -53,8 +53,29 @@ enum LexMode {
     Curly = 5,
     DoubleQuote = 6,
     HereDocument = 7,
+    Size = 8, // Just for NEST_TOTAL_SIZE
 }
-const NEST_TOTAL_SIZE: usize = 8; // @VOLATILE: 'LexMode' final discriminant + 1
+const NEST_TOTAL_SIZE: usize = LexMode::Size as usize;
+
+pub const DOES_DELIMIT: [bool; 128] = {
+    // Will not compile if size is not big enough
+    let mut in_progress = [false; 128];
+
+    in_progress['`' as usize] = true;
+    in_progress['$' as usize] = true;
+    in_progress[' ' as usize] = true;
+    in_progress['\t' as usize] = true;
+    in_progress['\n' as usize] = true;
+    in_progress['&' as usize] = true;
+    in_progress[';' as usize] = true;
+    in_progress['|' as usize] = true;
+    in_progress[')' as usize] = true;
+    in_progress['<' as usize] = true;
+    in_progress['>' as usize] = true;
+    // No conditional ones
+    in_progress
+};
+
 
 // Token, Strip Tabs?, Quoted Delim?
 type HereDocDelimList = VecDeque<(String, bool, bool)>;
@@ -103,9 +124,6 @@ struct LexemeBuffer<'a> {
 }
 
 impl<'a> LexemeBuffer<'a> {
-    fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
     fn is_first_lexeme(&self) -> bool {
         self.output_index == 0
     }
@@ -139,36 +157,18 @@ impl<'a> LexemeBuffer<'a> {
     fn delimit(&mut self) {
         // Strip leading blanks
         if !self.buffer.is_empty() {
-            // @POSIX 2.10.2 (Step 1) Shell Grammar Rules
-            // @TODO: Reserved words cannot have quotes
-            // @TODO: benchmark if this is faster than .take()
-            let lexeme = match self.buffer.as_str() {
-                _ if self.args_consumed != self.output_index => {
-                    Lexeme::Text(self.buffer.clone())
-                }
-                //"!" => Lexeme::ReservedExclamation,
-                "{" => Lexeme::ClosureStart, // @TODO: Figure out if this should interact with nesting feature
-                "}"=> Lexeme::ClosureClose,
-                "case" => Lexeme::Case,
-                "do" => Lexeme::Do,
-                "done" => Lexeme::Done,
-                "elif" => Lexeme::ElseIf,
-                "else" => Lexeme::Else,
-                "esac" => Lexeme::Esac,
-                "fi" => Lexeme::EndIf,
-                "for" => Lexeme::For,
-                "if" => Lexeme::If,
-                //"in" => Lexeme::In,
-                "then" => Lexeme::Then,
-                "until" => Lexeme::Until,
-                "while" => Lexeme::While,
-                _ => Lexeme::Text(self.buffer.clone()),
-            };
-            (self.emitter)(lexeme);
+            (self.emitter)(Lexeme::Text(self.buffer.clone()));
             self.buffer.clear();
             self.output_index += 1;
         }
     }
+
+    fn delimit_reserved(&mut self, reserved: Lexeme) {
+        (self.emitter)(reserved);
+        self.buffer.clear();
+        self.output_index += 1;
+    }
+
 
     #[cfg(debug_assertions)]
     #[cfg(test)]
@@ -375,6 +375,10 @@ impl<'a> TextGridWalk<'a> {
             }
         }
     }
+
+    fn peek_while_whitespace(&mut self) -> usize {
+        self.peek_while(|c| is_blank(c) || c == '\n')
+    }
 }
 
 // @POSIX: 2.7.4 Here-Document - Figure out what to do about
@@ -404,7 +408,7 @@ fn lexmode_here_document(
                     if line == token {
                         // Includes the trailing newline by convention
                         buffer.push_range(cursor.move_to(i));
-                        cursor.move_to(walker.peek_while(|c| c != '\n'));
+                        cursor.move_to(walker.peek_while_whitespace());
 
                         heredoc_delim_list.pop_front();
                         buffer.delimit();
@@ -423,7 +427,7 @@ fn lexmode_here_document(
             // See 'lexmode_double_quote()' for why these are not special cased
             '\\' => lex_backslash(walker, cursor, buffer),
             '`' => {
-                lex_backtick(walker, cursor, buffer, nesting, info);
+                lex_start_backtick(walker, cursor, buffer, nesting, info);
                 break; // because this nests
             }
             '$' => {
@@ -468,7 +472,7 @@ fn lexmode_double_quote(
             // 'hello "\ a"' -> <hello> <"\ a"> -> 'hello' '\ a'
             '\\' => lex_backslash(walker, cursor, buffer),
             '`' => {
-                lex_backtick(walker, cursor, buffer, nesting, info);
+                lex_start_backtick(walker, cursor, buffer, nesting, info);
                 return true; // because this nests
             }
             '$' => {
@@ -637,7 +641,7 @@ fn file_lex<F: FnMut(Lexeme)>(body: &str, emit: &mut F) {
     // @TODO Error on left-over nestings?
 }
 
-fn lex_backtick(
+fn lex_start_backtick(
     walker: &mut TextGridWalk,
     cursor: &mut Cursor,
     buffer: &mut LexemeBuffer,
@@ -726,7 +730,7 @@ fn lex_command_end(
         buffer.args_consumed = 0;
     }
     // Skip until the next non-blank, non-newline character
-    let non_blank = walker.peek_while(|c| is_blank(c) || c == '\n');
+    let non_blank = walker.peek_while_whitespace();
     cursor.move_to(non_blank);
 }
 
@@ -759,9 +763,7 @@ fn lex_regular(
 
         // Escaping is different within quotes/here-documents
         '"' => nesting.start(buffer, info, LexMode::DoubleQuote),
-        '`' => lex_backtick(walker, cursor, buffer, nesting, info),
-
-        // @POSIX
+        '`' => lex_start_backtick(walker, cursor, buffer, nesting, info),
         '$' => lex_dollar(walker, cursor, buffer, nesting, info),
 
         // @VOLATILE: make sure this happens before handling blanks in
@@ -771,8 +773,6 @@ fn lex_regular(
         // In POSIX, only newlines end commands (and ; &) see 2.9.3
         // Carriage-return is a non-space
         '\n' => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
             if heredoc_delim_list.is_empty() {
                 lex_command_end(walker, cursor, buffer, Lexeme::EndOfCommand);
 
@@ -802,8 +802,6 @@ fn lex_regular(
         // @VOLATILE: make sure this happens after handling newlines in
         //            case 'is_blank' also returns true for newlines
         _ if is_blank(ch) => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
             // Skip continguous <blank>
             cursor.move_to(walker.peek_while(is_blank));
 
@@ -817,14 +815,10 @@ fn lex_regular(
             }
         }
         '&' => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
             lex_command_end(walker, cursor, buffer, Lexeme::EndOfBackgroundCommand);
         }
 
         ';' => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
             if let Some((_, _, ';', _)) = walker.peek() {
                 walker.next();
                 lex_command_end(walker, cursor, buffer, Lexeme::Break);
@@ -834,15 +828,10 @@ fn lex_regular(
         }
 
         '|' => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
             lex_command_end(walker, cursor, buffer, Lexeme::Pipe);
         }
 
         ')' if nesting.depth_of(LexMode::Parenthesis) > 0 => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
-
             match (nesting.current_type(), walker.peek()) {
                 (Some(LexMode::Arithmetic), Some((_, _, ')', _))) => {
                     cursor.move_to(index + "))".len());
@@ -875,10 +864,8 @@ fn lex_regular(
             let name = &buffer.source[cursor.span(index)];
 
             if !buffer.is_first_lexeme() {
-                panic!("'(' cannot be passed as parameter unquoted. Use '$(' if you want a string. If intended to be a command grouping, put on newline or delimit with ';', '&', '|', etc.");
+                //panic!("'(' cannot be passed as parameter unquoted. Use '$(' if you want a string. If intended to be a command grouping, put on newline or delimit with ';', '&', '|', etc.");
             } else if name.is_empty() {
-                buffer.push_range(cursor.move_to(index));
-                buffer.delimit();
                 cursor.move_to(index + '('.len_utf8());
 
                 // 'start()' before 'emit()' start lexeme
@@ -890,7 +877,7 @@ fn lex_regular(
                     buffer.emit(Lexeme::Function(name.into()));
                     buffer.output_index = 0;
                     buffer.args_consumed = 0;
-                    let non_blank = walker.peek_while(|c| is_blank(c) || c == '\n');
+                    let non_blank = walker.peek_while_whitespace();
                     cursor.move_to(non_blank);
                 } else {
                     panic!("Expecting function decleration '{}()'", name);
@@ -901,9 +888,6 @@ fn lex_regular(
         }
 
         '<' => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
-
             match walker.peek() {
                 // "<<"
                 Some((_, _, '<', _)) => {
@@ -928,7 +912,7 @@ fn lex_regular(
             }
         }
 
-        // @TODO Rust RFC 2353 issue #60553 means no more allocation
+        // @TODO Rust RFC 2363 issue #60553 means no more allocation
         '=' if buffer.is_first_lexeme() => {
             let varname = &buffer.source[cursor.span(index)];
             let is_valid = find_valid_variable_name(varname) == varname.len();
@@ -940,17 +924,65 @@ fn lex_regular(
             } // else is just plaintext to be lexed as 'Lexeme::Text'
         }
 
-        '#' if buffer.is_empty() => {
-            buffer.push_range(cursor.move_to(index));
-            buffer.delimit();
-
+        // 'hello#' is not a comment
+        // 'hello #' is
+        '#' if buffer.source[cursor.span(index)].is_empty() => {
             let before_newline = walker.peek_while(|c| c != '\n');
             cursor.move_to(before_newline);
-            // Without the '#'
-            buffer.emit(Lexeme::Comment(rest_of_line[1..].into()));
+            let line_without_pound = rest_of_line[1..].into();
+            buffer.emit(Lexeme::Comment(line_without_pound));
+
+            // Let lex_end_command trigger at newline in case of
+            // "cmd arg1  # comment same line\n"
         }
 
         _ => {} // Allow it to perform 'walker.next()' in peace
+    }
+
+    let to_push = &buffer.source[cursor.span(walker.current_end_index())];
+    let is_to_delimit = match walker.peek().map(|(_, _, peek_ch, _)| peek_ch) {
+        Some(c) if c as usize <= DOES_DELIMIT.len() => DOES_DELIMIT[c as usize],
+        Some('(') if buffer.is_first_lexeme() && to_push.is_empty() => true,
+        //Some('#') if buffer.is_empty() && to_push.is_empty() => true,
+        None => true,
+        _ => false,
+    };
+
+    if is_to_delimit {
+        buffer.push_range(cursor.move_to(walker.current_end_index()));
+
+        // @POSIX 2.10.2 (Step 1) Shell Grammar Rules
+        let is_reserved = match buffer.buffer.as_str() {
+            _ if buffer.args_consumed != buffer.output_index => None,
+            // @TODO: Figure out if this should interact with nesting feature
+            "{" => Some(Lexeme::ClosureStart),
+            "}"=> Some(Lexeme::ClosureClose),
+            "case" => Some(Lexeme::Case),
+            "do" => Some(Lexeme::Do),
+            "done" => Some(Lexeme::Done),
+            "elif" => Some(Lexeme::ElseIf),
+            "else" => Some(Lexeme::Else),
+            "esac" => Some(Lexeme::EndCase),
+            "fi" => Some(Lexeme::EndIf),
+            "for" => Some(Lexeme::For),
+            "if" => Some(Lexeme::If),
+            //"in" => Some(Lexeme::In),
+            "then" => {
+                // @TODO: skip whitespace like so on nesting starters?
+                //cursor.move_to(walker.peek_while_whitespace());
+                Some(Lexeme::Then)
+            }
+            "until" => Some(Lexeme::Until),
+            "while" => Some(Lexeme::While),
+            _ => None
+        };
+        if let Some(reserved) = is_reserved {
+            buffer.delimit_reserved(reserved);
+            walker.peek_while(is_blank);
+            // @TODO: maybe eat whitespace after?
+        } else {
+            buffer.delimit();
+        }
     }
 }
 

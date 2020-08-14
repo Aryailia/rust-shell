@@ -1,3 +1,5 @@
+#![feature(arbitrary_enum_discriminant)]
+
 //run: cargo test shell_tests -- --nocapture
 
 // Dash is: git.kernel.org/pub/scm/utils/dash.git
@@ -76,11 +78,18 @@ echo "hello " bub
     #[test]
     fn development() {
         let input = r#"
-sed 's/ *|//' ~/.environment/bookmarks.csv
-echo "$( cat me.adoc )"
-a=hello
-<hello cat -
+printf %s\\n asdf
+while $( echo yo ); do
+    echo yo
+    cat asdf
+done
         "#;
+//        let input = r#"
+//sed 's/ *|//' ~/.environment/bookmarks.csv
+//echo "$( cat me.adoc )"
+//a=hello
+//<hello cat -
+//        "#;
 
         println!("{}\n========", input);
 

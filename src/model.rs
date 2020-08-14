@@ -1,61 +1,156 @@
-// @TODO change to Cow<str> or &str if possible for later stages
-#[derive(Clone, Debug, PartialEq)]
-pub enum Lexeme {
-    Text(String), // 'Text(..)' is parts of 'words' as defined in @POSIX 2
-    Comment(String),
-    Separator,
+//run: cargo test model -- --nocapture
 
-    // These cause 'output_index' and 'args_consumed' to reset to zero
-    EndOfCommand,
-    Pipe,
-    EndOfBackgroundCommand,
-    Break,
-    Function(String),
+macro_rules! define_lexeme2 {
+    (_level) => {
+    };
 
-    // Variables
-    Variable(String),
-    Private(usize, usize), // @TODO: Only for use in the parser
+    // Entry point
+    (_enum $enum_name:ident : $repr:ty {
+        $(
+            $level:tt | $num_of_parsemes:literal |
+                $variant:ident $(($data:ty))?
+                    $(= $ref:ident = $discriminant:literal)?
+        ,)*
+    }) => {
+        // Centralised place to change the type of the discriminant
+        #[derive(Clone, Debug, PartialEq)]
+        #[repr(u8)]
+        pub enum $enum_name {
+            $($variant $(($data))* $(= $discriminant)* ,)*
+        }
+        $($(const $ref: $repr = $discriminant;)*)*
 
-    // These deal with nesting
-    ArithmeticStart,
-    ArithmeticClose,
-    SubShellStart,
-    SubShellClose,
-    ClosureStart,
-    ClosureClose,
-    HereDocStart,
-    EndOfFile,
+        impl $enum_name {
+            // Rust reference @PULL 639
+            // @RFC 2363 @ISSUE 60553
+            pub fn id(&self) -> $repr {
+                unsafe { *(self as *const Self as *const $repr) }
+            }
+        }
 
-    OpInputHereDoc,
-    OpInput,
-    OpOutput,
-    OpAssign,
+        #[test]
+        fn validate_named_discriminants2() {
+            // Make sure our named discriminants ($ref) are matching associated
+            // call to .id()
+            $(
+                // If no '$const_name' input, '_lexeme' will be not be used
+                // hence the naming with an underscore
+                let _lexeme = $enum_name::$variant $((<$data>::default() ))*;
+                $( debug_assert_eq!(_lexeme.id(), $ref); )*
+            )*
+        }
 
-    // Reserved words
-    Case,
-    Do,
-    Done,
-    ElseIf,
-    Else,
-    Esac,
-    EndIf,
-    For,
-    If,
-    In,
-    Then,
-    Until,
-    While,
+    };
 
-    Debug(String),
 }
+
+define_lexeme2! {
+    _enum Lexeme2: u8 {
+        - | 0 | Hello,
+        + | 0 | Yo,
+    }
+}
+
+// @TODO change to Cow<str> or &str if possible for later stages
+// @TODO replace this with a proc macro
+// @TODO https://github.com/landair/rust-proc-macro-without-dependencies
+// Intended to be one-time use
+macro_rules! define_lexeme {
+    (_enum $enum_name:ident : $repr:ty { $(
+        $variant:ident $(($data:ty))?  $(= $ref:ident = $discriminant:literal)?
+    ,)*}) => {
+        // @VOLATILE, change this to match $repr when used
+        #[derive(Clone, Debug, PartialEq)]
+        #[repr(u8)]
+        pub enum $enum_name {
+            $($variant $(($data))* $(= $discriminant)* ,)*
+        }
+        $($(const $ref: $repr = $discriminant;)*)*
+
+        impl $enum_name {
+            // Rust reference @PULL 639
+            // @RFC 2363 @ISSUE 60553
+            pub fn id(&self) -> $repr {
+                unsafe { *(self as *const Self as *const $repr) }
+            }
+        }
+
+        #[test]
+        fn validate_named_discriminants() {
+            // Make sure our named discriminants ($ref) are matching associated
+            // call to .id()
+            $(
+                // If no '$const_name' input, '_x' will be not be used
+                // hence the naming with an underscore
+                let _x = $enum_name::$variant $((<$data>::default() ))*;
+                $( debug_assert_eq!(_x.id(), $ref); )*
+            )*
+        }
+
+    };
+}
+
+define_lexeme!{
+    _enum Lexeme: u8 {
+        // 'Text(..)' is parts of 'words' as defined in @POSIX 2
+        Text(String) = LEXEME_TEXT = 0,
+        Comment(String) = LEXEME_COMMENT = 1,
+        Separator,
+
+        // These cause 'output_index' and 'args_consumed' to reset to zero
+        EndOfCommand,
+        Pipe,
+        EndOfBackgroundCommand,
+        Break,
+        Function(String) = LEXEME_FUNCTION = 8,
+
+        // Variables
+        Variable(String) = LEXEME_VARIABLE = 9,
+        // @TODO: Only for use in the parser
+        Private((usize, usize)) = LEXEME_PRIVATE = 10,
+
+        // These deal with nesting
+        ArithmeticStart,
+        ArithmeticClose,
+        SubShellStart,
+        SubShellClose,
+        ClosureStart,
+        ClosureClose,
+        HereDocStart,
+        EndOfFile,
+
+        OpInputHereDoc,
+        OpInput,
+        OpOutput,
+        OpAssign,
+
+        // Reserved words
+        Case,
+        Do,
+        Done,
+        ElseIf,
+        Else,
+        EndCase,
+        EndIf,
+        For,
+        If,
+        In,
+        Then,
+        Until,
+        While,
+
+        Debug(String),
+    }
+}
+
 
 #[derive(Debug)]
 pub enum Parseme {
     Assign,
     Label(usize, usize),
-    JumpIfFalse(usize, usize),
-    JumpIfTrue(usize, usize),
-    Jump(usize, usize),
+    JumpIfFalse(usize),
+    JumpIfTrue(usize),
+    Jump(usize),
     External(Executable),
     Debug(Vec<Lexeme>),
 }
