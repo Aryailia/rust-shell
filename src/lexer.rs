@@ -978,8 +978,8 @@ fn lex_regular(
         };
         if let Some(reserved) = is_reserved {
             buffer.delimit_reserved(reserved);
-            walker.peek_while(is_blank);
             // @TODO: maybe eat whitespace after?
+            //cursor.move_to(walker.peek_while(is_blank));
         } else {
             buffer.delimit();
         }

@@ -1,144 +1,138 @@
 //run: cargo test model -- --nocapture
 
-macro_rules! define_lexeme2 {
-    (_level) => {
-    };
-
-    // Entry point
-    (_enum $enum_name:ident : $repr:ty {
-        $(
-            $level:tt | $num_of_parsemes:literal |
-                $variant:ident $(($data:ty))?
-                    $(= $ref:ident = $discriminant:literal)?
-        ,)*
-    }) => {
-        // Centralised place to change the type of the discriminant
-        #[derive(Clone, Debug, PartialEq)]
-        #[repr(u8)]
-        pub enum $enum_name {
-            $($variant $(($data))* $(= $discriminant)* ,)*
-        }
-        $($(const $ref: $repr = $discriminant;)*)*
-
-        impl $enum_name {
-            // Rust reference @PULL 639
-            // @RFC 2363 @ISSUE 60553
-            pub fn id(&self) -> $repr {
-                unsafe { *(self as *const Self as *const $repr) }
-            }
-        }
-
-        #[test]
-        fn validate_named_discriminants2() {
-            // Make sure our named discriminants ($ref) are matching associated
-            // call to .id()
-            $(
-                // If no '$const_name' input, '_lexeme' will be not be used
-                // hence the naming with an underscore
-                let _lexeme = $enum_name::$variant $((<$data>::default() ))*;
-                $( debug_assert_eq!(_lexeme.id(), $ref); )*
-            )*
-        }
-
-    };
-
-}
-
-define_lexeme2! {
-    _enum Lexeme2: u8 {
-        - | 0 | Hello,
-        + | 0 | Yo,
-    }
-}
-
 // @TODO change to Cow<str> or &str if possible for later stages
 // @TODO replace this with a proc macro
 // @TODO https://github.com/landair/rust-proc-macro-without-dependencies
 // Intended to be one-time use
 macro_rules! define_lexeme {
-    (_enum $enum_name:ident : $repr:ty { $(
-        $variant:ident $(($data:ty))?  $(= $ref:ident = $discriminant:literal)?
-    ,)*}) => {
+    (@level -) => { -1 };
+    (@level =) => { 0 };
+    (@level +) => { 1 };
+    (@enum $enum_name:ident : $repr:ty {
+        $(
+            $($num_of_parsemes:literal | $level:tt | )?
+                $variant:ident $(($data:ty))?
+                    $(= $named_discriminant:ident = $discriminant:literal)?
+        ,)*
+    }) => {
         // @VOLATILE, change this to match $repr when used
         #[derive(Clone, Debug, PartialEq)]
         #[repr(u8)]
         pub enum $enum_name {
             $($variant $(($data))* $(= $discriminant)* ,)*
         }
-        $($(const $ref: $repr = $discriminant;)*)*
+        $($(const $named_discriminant: $repr = $discriminant;)*)*
 
         impl $enum_name {
             // Rust reference @PULL 639
             // @RFC 2363 @ISSUE 60553
+            #[inline]
             pub fn id(&self) -> $repr {
                 unsafe { *(self as *const Self as *const $repr) }
             }
         }
 
+        pub const LEXEME_PARSEME_COUNT: [u8; LEXEME_OPTIONS_COUNT as usize] = {
+            let mut temp = [0; LEXEME_OPTIONS_COUNT as usize];
+            let mut _i = 0;
+            $(
+                $(temp[_i] = $num_of_parsemes;)*
+                _i += 1;
+            )*
+            temp
+        };
+
+        pub const LEXEME_LEVEL: [i8; LEXEME_OPTIONS_COUNT as usize] = {
+            let mut temp = [0; LEXEME_OPTIONS_COUNT as usize];
+            let mut i: usize = 0;
+            $(
+                $(temp[i] = define_lexeme!(@level $level);)*
+                i += 1;
+            )*
+            temp
+        };
+
+        // @TODO: these tests can go away if we do a proc macro
         #[test]
         fn validate_named_discriminants() {
-            // Make sure our named discriminants ($ref) are matching associated
+            let mut i = 0;
+
+            // Make sure our named discriminants are matching associated
             // call to .id()
             $(
-                // If no '$const_name' input, '_x' will be not be used
-                // hence the naming with an underscore
-                let _x = $enum_name::$variant $((<$data>::default() ))*;
-                $( debug_assert_eq!(_x.id(), $ref); )*
+                let x = $enum_name::$variant $((<$data>::default() ))*;
+                // Only enumerates if discriminant was named
+                $( assert_eq!(x.id(), $named_discriminant); )*
+
+                // Discriminants are the defaults (sequentially + 1 from 0)
+                assert_eq!(x.id(), {
+                    i += 1;
+                    i - 1
+                });
             )*
+
         }
 
     };
 }
 
-define_lexeme!{
-    _enum Lexeme: u8 {
+//#[test]
+//fn asdf() {
+//    println!("{:?}", Lexeme::Pipe as usize);
+//}
+
+pub type LexemeRepr = u8;
+
+define_lexeme! {
+    @enum Lexeme: LexemeRepr {
         // 'Text(..)' is parts of 'words' as defined in @POSIX 2
-        Text(String) = LEXEME_TEXT = 0,
-        Comment(String) = LEXEME_COMMENT = 1,
-        Separator,
+        0 | = | Text(String) = LEXEME_TEXT = 0,
+        0 | = | Comment(String) = LEXEME_COMMENT = 1,
+        0 | = | Separator,
 
         // These cause 'output_index' and 'args_consumed' to reset to zero
-        EndOfCommand,
-        Pipe,
-        EndOfBackgroundCommand,
-        Break,
-        Function(String) = LEXEME_FUNCTION = 8,
+        1 | = | EndOfCommand,
+        1 | = | Pipe,
+        1 | = | EndOfBackgroundCommand,
+        1 | = | Break,
 
         // Variables
-        Variable(String) = LEXEME_VARIABLE = 9,
+        0 | = | Function(String) = LEXEME_FUNCTION = 7,
+        0 | = | Variable(String) = LEXEME_VARIABLE = 8,
         // @TODO: Only for use in the parser
-        Private((usize, usize)) = LEXEME_PRIVATE = 10,
+        0 | = | Private((usize, usize)) = LEXEME_PRIVATE = 9,
 
         // These deal with nesting
-        ArithmeticStart,
-        ArithmeticClose,
-        SubShellStart,
-        SubShellClose,
-        ClosureStart,
-        ClosureClose,
-        HereDocStart,
-        EndOfFile,
+        0 | + | ArithmeticStart,
+        1 | - | ArithmeticClose,
+        0 | + | SubShellStart,
+        1 | - | SubShellClose,
+        0 | + | ClosureStart,
+        1 | - | ClosureClose,
+        0 | + | HereDocStart,
+        0 | - | EndOfFile,
 
-        OpInputHereDoc,
-        OpInput,
-        OpOutput,
-        OpAssign,
+        0 | = | OpInputHereDoc,
+        0 | = | OpInput,
+        0 | = | OpOutput,
+        0 | = | OpAssign,
 
         // Reserved words
-        Case,
-        Do,
-        Done,
-        ElseIf,
-        Else,
-        EndCase,
-        EndIf,
-        For,
-        If,
-        In,
-        Then,
-        Until,
-        While,
+        1 | + | Case,
+        1 | - | EndCase,
+        1 | = | Do, // Level increase handled by Lexeme::While/Until/For
+        0 | - | Done, // count = 0 because Lexeme::EndOfCommand follows
+        1 | = | ElseIf,
+        1 | = | Else,
+        1 | - | EndIf,
+        1 | + | For,
+        1 | + | If,
+        0 | = | In,
+        1 | - | Then, // Level increase handled by Lexeme::If
+        1 | + | Until,
+        1 | + | While,
 
+        Size = LEXEME_OPTIONS_COUNT = 35,
         Debug(String),
     }
 }
@@ -222,5 +216,3 @@ impl IoHandles {
         }
     }
 }
-
-
