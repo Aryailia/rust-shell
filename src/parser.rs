@@ -1,26 +1,35 @@
 //run: cargo test shell_tests -- --nocapture
 
-use crate::model::{Executable, FileId, IoHandles, Lexeme, Parseme};
+// This implements a double buffer because we need to buffer receiver
+// until the end of a structure (like a while-do-done), so we know how
+// long it is. We need to calculate the jump offset at some point.
+// Could also do this later down the pipeline
+
+// Input 'Lexeme's, output 'Parseme's
+
+use crate::model::{Executable, FileId, IoHandles, Parseme as P};
+use crate::model::{Lexeme as L, LexemeRepr, LEXEME_LEVEL, LEXEME_PARSEME_COUNT};
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use futures::stream::{Peekable, Stream};
-use futures::{future, stream, StreamExt};
-use std::io;
-use std::mem::{discriminant, replace, Discriminant};
-use std::pin::Pin;
-use std::process::{Command, Stdio};
+use futures::{stream::Peekable, stream::Stream, StreamExt};
 use std::collections::VecDeque;
+use std::mem::replace;
+use std::pin::Pin;
 
-type ParserInput = UnboundedReceiver<Lexeme>;
+type ParserInput<'a> = Pin<&'a mut Peekable<UnboundedReceiver<L>>>;
 
-// The output type
+//#[derive(Debug)]
+//struct Nesting {
+//    temp_var_count: usize,
+//    handles: IoHandles,
+//    mode: ParseMode,
+//}
 
-#[derive(Debug)]
-struct Nesting {
-    temp_var_count: usize,
-    handles: IoHandles,
-    mode: ParseMode,
-}
+
+//enum Parseme {
+//    Lexeme(L),
+//    Temp(usize, usize),
+//}
 
 #[derive(Debug)]
 struct ParserNesting {
@@ -29,6 +38,7 @@ struct ParserNesting {
 
     // Number of temporary values needed (0-indexed), handles for the nesting
     stack: Vec<(usize, IoHandles, ParseMode)>,
+    command_handles: IoHandles,
 }
 impl ParserNesting {
     fn new() -> Self {
@@ -37,6 +47,7 @@ impl ParserNesting {
             // Keeping track of the IO handles for each nesting
             stack: vec![(0, IoHandles::new(), ParseMode::Regular)],
             label_index: 0,
+            command_handles: IoHandles::new(),
         }
     }
     fn start(&mut self, mode: ParseMode, redirected_handles: Option<IoHandles>) {
@@ -53,6 +64,7 @@ impl ParserNesting {
         ));
         self.stack[level].0 += 1; // Post placement means 0-indexed
         self.level += 1;
+        self.command_handles = self.copy_current();
     }
 
     fn close(&mut self) -> (usize, usize, ParseMode) {
@@ -78,55 +90,50 @@ impl ParserNesting {
 // The state for the FSM (Finite State Machine)
 #[derive(Debug)]
 struct ParsemeBuilder {
-    output: UnboundedSender<Parseme>,
-    mode: ParseMode,
+    output: UnboundedSender<P>,
 
-    buffer: Vec<Lexeme>,
+    buffer: Vec<L>,
     nesting: ParserNesting,
-    command_handles: IoHandles,
     label: usize, // For loops and function calls
     queue: Queue,
     output_index: usize,
 }
 
-impl ParsemeBuilder {
-    fn emit(&mut self, stmt: Parseme) {
-        self.output.unbounded_send(stmt).unwrap();
-        self.output_index += 1;
-    }
+fn emit(output: &mut UnboundedSender<P>, output_index: &mut usize, stmt: P) {
+    output.unbounded_send(stmt).unwrap();
+    *output_index += 1;
+}
 
-    fn emit_parseme(&mut self) {
-        let Self {
-            buffer,
-            nesting,
-            command_handles,
-            output,
-            ..
-        } = self;
-        let len = buffer.len();
-        let last_unnested_index = buffer
+
+trait ParsemeBuffer {
+    fn pop_parseme(&mut self, nesting: &mut ParserNesting) -> Option<P>;
+}
+
+impl ParsemeBuffer for Vec<L> {
+    fn pop_parseme(&mut self, nesting: &mut ParserNesting) -> Option<P> {
+        let len = self.len();
+        let last_unnested_index = self
             .iter()
             .rev()
             .position(|lexeme| match lexeme {
-                Lexeme::ArithmeticStart
-                | Lexeme::SubShellStart
-                | Lexeme::ClosureStart
-                | Lexeme::If
-                | Lexeme::While
-                | Lexeme::Until => true,
+                L::ArithmeticStart
+                | L::SubShellStart
+                | L::ClosureStart
+                | L::If
+                | L::While
+                | L::Until => true,
                 _ => false,
             })
             .map(|reverse_index| len - reverse_index)
             .unwrap_or(0);
 
-        let args = buffer.split_off(last_unnested_index);
+        let args = self.split_off(last_unnested_index);
         if !args.is_empty() {
-            let handles = replace(command_handles, nesting.copy_current());
-
-            self.output_index += 1;
-            output
-                .unbounded_send(Parseme::External(Executable { args, handles }))
-                .unwrap()
+            let default_handles = nesting.copy_current();
+            let handles = replace(&mut nesting.command_handles, default_handles);
+            Some(P::Statement(Executable { args, handles }))
+        } else {
+            None
         }
     }
 }
@@ -139,107 +146,114 @@ impl ParsemeBuilder {
 // For relational lexemes (requires more than on lexeme to have meaning), we
 // change states for our parser FSM ('parsemode_*')
 // True if opens a nesting
-fn parse_regular(builder: &mut ParsemeBuilder) {
+fn parse_regular(ParsemeBuilder { buffer, nesting, queue, output, output_index, ..  }: &mut ParsemeBuilder) {
     // @TODO This should be exhaustive to catch all errors
-    while let Some(lexeme) = builder.queue.pop_front() {
+    while let Some(lexeme) = queue.pop_front() {
         match &lexeme {
-            Lexeme::Comment(_) => {}
+            L::Comment(_) => {}
 
-            Lexeme::SubShellStart => {
-                builder.nesting.start(ParseMode::Scoped, None);
-                builder.buffer.push(lexeme); // Important for 'emit_parseme()'
+            L::SubShellStart => {
+                nesting.start(ParseMode::Scoped, None);
+                buffer.push(lexeme); // Important for 'pop_parseme()'
             }
-            Lexeme::SubShellClose | Lexeme::ClosureClose => {
-                builder.emit_parseme();
-                if let None = builder.buffer.pop() {
+            L::SubShellClose | L::ClosureClose => {
+                buffer.push(lexeme); // Important for 'emit_parseme()'
+                if let Some(stmt) = buffer.pop_parseme(nesting) {
+                    emit(output, output_index, stmt);
+                } else {
+                    panic!("No statements inside of me");
+                }
+                if let None = buffer.pop() {
                     // remove the starter
                     unreachable!("The lexer should catch unmatched parens");
                 }
 
-                let handle = builder.nesting.close();
-                builder.buffer.push(Lexeme::Private((handle.0, handle.1)));
+                let handle = nesting.close();
+                buffer.push(L::Private((handle.0, handle.1)));
             }
 
-            Lexeme::OpAssign => {
-                if let Some(Lexeme::Variable(name)) = builder.buffer.pop() {
-                    builder.command_handles.stdout = FileId::PublicVariable(name);
+            L::OpAssign => {
+                if let Some(L::Variable(name)) = buffer.pop() {
+                    nesting.command_handles.stdout = FileId::PublicVariable(name);
                 } else {
                     // This should be ensured by the lexer
                     unreachable!("'=' did not find a variable");
                 }
             }
 
-            Lexeme::OpInput | Lexeme::OpOutput | Lexeme::OpInputHereDoc => {
-                let len = builder.buffer.len();
+            L::OpInput | L::OpOutput | L::OpInputHereDoc => {
+                let len = buffer.len();
                 let switch_to = ParseMode::NextWord(lexeme, len);
-                builder.nesting.start(switch_to, None);
+                nesting.start(switch_to, None);
             }
 
-            Lexeme::While => {
-                let start_index = builder.output_index;
-                builder.nesting.start(ParseMode::While(start_index), None);
+            L::While => {
+                let start_index = *output_index;
+                nesting.start(
+                    ParseMode::While(start_index),
+                    Some(nesting.copy_current()),
+                );
             }
 
-            Lexeme::Separator => {}
+            L::Separator => {}
 
-            Lexeme::EndOfCommand => {
-                builder.nesting.reset();
-                builder.emit_parseme();
+            L::EndOfCommand => {
+                nesting.reset();
+                if let Some(stmt) = buffer.pop_parseme(nesting) {
+                    emit(output, output_index, stmt);
+                }
+                // Fine to be an empty command?
             }
-            Lexeme::Text(_) => {
-                builder.buffer.push(lexeme);
+            L::Text(_) => {
+                buffer.push(lexeme);
             }
 
-            Lexeme::Do => {
+            L::Do => {
                 // @TODO: fix lexer so we do not need this
-                if let Some(Lexeme::EndOfCommand) = builder.queue.get(0) {
-                    builder.queue.pop_front();
+                if let Some(L::EndOfCommand) = queue.get(0) {
+                    queue.pop_front();
                 }
 
+                queue.push_front(L::Do); // for 'count_parsemes()'
+                let body_count = count_parsemes(queue, 0, L::Done.id());
+                let end_index = *output_index + body_count;
+                //println!("index {} {}", output_index, body);
 
-                builder.queue.push_front(Lexeme::Do); // for 'count_parsemes()'
-                println!("queue {:?}", builder.queue);
-                let end_index = builder.output_index + count_parsemes(&builder.queue, 0, discriminant(&Lexeme::Done));
-                //println!("index {} {}", builder.output_index, body);
-
-                // + 1 to arrive after the final jump of Lexeme::Done
-                match builder.nesting.current_mode() {
+                // + 1 to arrive after the final jump of L::Done
+                match nesting.current_mode() {
                     ParseMode::While(_) => {
-                        builder.emit(Parseme::JumpIfFalse(end_index));
+                        emit(output, output_index, P::JumpIfFalse(end_index));
                     }
                     ParseMode::Until(_) => {
-                        builder.emit(Parseme::JumpIfTrue(end_index));
+                        emit(output, output_index, P::JumpIfTrue(end_index));
                     }
                     _ => unreachable!("Should be count by queueing function"),
                 }
 
-                builder.queue.pop_front(); // Remove the added one
+                queue.pop_front(); // Remove the added one
             }
 
-            Lexeme::Done => {
-                match builder.nesting.close().2 {
-                    ParseMode::While(index) | ParseMode::Until(index) =>
-                        builder.emit(Parseme::Jump(index)),
-                    _ => panic!("'done' with no associated 'do'"),
-                }
-            }
+            L::Done => match nesting.close().2 {
+                ParseMode::While(index) | ParseMode::Until(index) => emit(output, output_index, P::Jump(index)),
+                _ => panic!("'done' with no associated 'do'"),
+            },
 
             _ => {
-                builder.buffer.push(lexeme);
+                buffer.push(lexeme);
             }
         }
     }
 }
 
-fn pop_front_while_next_is<T, F: Fn(&T) -> bool>(queue: &mut VecDeque<T>, sentinel: F) {
-    while let Some(x) = queue.get(0) {
-        if sentinel(x) {
-            queue.pop_front();
-        } else {
-            break;
-        }
-    }
-}
+//fn pop_front_while_next_is<T, F: Fn(&T) -> bool>(queue: &mut VecDeque<T>, sentinel: F) {
+//    while let Some(x) = queue.get(0) {
+//        if sentinel(x) {
+//            queue.pop_front();
+//        } else {
+//            break;
+//        }
+//    }
+//}
 
 //
 // The possible modes for the FSM
@@ -247,115 +261,161 @@ fn pop_front_while_next_is<T, F: Fn(&T) -> bool>(queue: &mut VecDeque<T>, sentin
 enum ParseMode {
     Regular,
     Scoped,
-    NextWord(Lexeme, usize),
-    ControlFlow(Lexeme),
-    ControlBody(Lexeme),
+    NextWord(L, usize),
+    ControlFlow(L),
+    ControlBody(L),
     While(usize),
     Until(usize),
 }
 
-pub async fn job_stream_parse(input: ParserInput, output: UnboundedSender<Parseme>) {
+pub async fn job_stream_parse(input: UnboundedReceiver<L>, output: UnboundedSender<P>) {
     let input = &mut input.peekable();
     let mut input = Pin::new(input);
 
     let nesting = ParserNesting::new();
-    let command_handles = nesting.copy_current();
 
     let builder = &mut ParsemeBuilder {
         output,
-        mode: ParseMode::Regular,
         nesting,
         buffer: Vec::new(),
         label: 0,
-        command_handles,
         queue: VecDeque::new(),
         output_index: 0,
     };
 
     while let Some(peek) = input.as_mut().peek().await {
+        let queue = &mut builder.queue;
         match peek {
-            Lexeme::While | Lexeme::Until => {
-                buffer_loop(builder, input.as_mut()).await;
+            L::While | L::Until => {
+                buffer_loop(queue, input.as_mut()).await;
             }
             _ => {
-                let command_end = discriminant(&Lexeme::EndOfCommand);
-                let queue = &mut builder.queue;
-                buffer_parsemes_till(queue, input.as_mut(), command_end).await;
+                let eoc = L::EndOfCommand.id();
+                buffer_parsemes_to(queue, input.as_mut(), 0, eoc).await;
             }
         }
+        verify_nesting(queue).unwrap();
         parse_regular(builder);
     }
     //println!("{:?}", builder.queue);
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// Buffering commands
+type Queue = VecDeque<L>;
 
-type Queue = VecDeque<Lexeme>;
+async fn buffer_loop(queue: &mut Queue, mut stream: ParserInput<'_>) {
+    if let Some(L::While) = stream.as_mut().next().await {
+        queue.push_back(L::While);
+    } else {
+        unreachable!("Not called on a while loop");
+    }
 
+    let eoc = L::EndOfCommand.id();
+    buffer_parsemes_to(queue, stream.as_mut(), 0, eoc).await;
 
-async fn buffer_loop(builder: &mut ParsemeBuilder, mut stream: Pin<&mut Peekable<ParserInput>>) {
-    let ParsemeBuilder { queue, ..} = builder;
-    let command_end = discriminant(&Lexeme::EndOfCommand);
-    buffer_parsemes_till(queue, stream.as_mut(), command_end).await;
-    //builder.nesting.reset();
-
-    let _count = if let Some(Lexeme::Do) = stream.as_mut().peek().await {
-        let while_end = discriminant(&Lexeme::Done);
-        buffer_parsemes_till(queue, stream.as_mut(), while_end).await
+    if let Some(L::Do) = stream.as_mut().peek().await {
+        let while_end = L::Done.id();
+        let level = LEXEME_LEVEL[L::While.id() as usize] as isize;
+        buffer_parsemes_to(queue, stream.as_mut(), level, while_end).await
     } else {
         panic!("Did not find do associated with while loop");
     };
-    buffer_parsemes_till(queue, stream.as_mut(), command_end).await;
-
-    // nesting.start()
-
-    //println!("{} {:?}", parseme_count, builder.buffer);
+    buffer_parsemes_to(queue, stream.as_mut(), 0, eoc).await;
 }
 
 // @TODO convert these into array lookups
-async fn buffer_parsemes_till(
+async fn buffer_parsemes_to(
     queue: &mut Queue,
-    mut stream: Pin<&mut Peekable<ParserInput>>,
-    close_lexeme: Discriminant<Lexeme>,
+    mut stream: ParserInput<'_>,
+    start_level: isize,
+    close_lexeme: LexemeRepr,
 ) {
-    let mut level = 0usize;
+    //println!("{:?}", queue);
+    let mut level = start_level;
     while let Some(lexeme) = stream.as_mut().next().await {
-        match &lexeme {
-            Lexeme::If | Lexeme::Do => { level += 1; }
-            Lexeme::EndIf | Lexeme::Done => { level -= 1; }
-            _ => {}
-        }
+        level += LEXEME_LEVEL[lexeme.id() as usize] as isize;
+        //println!("  {} {:?}", level, lexeme);
 
-        if level == 0 && discriminant(&lexeme) == close_lexeme {
-            queue.push_back(lexeme);
+        if level < 0 {
+            panic!("Logic error with start_level or LEXEME_LEVEL");
+        } else if level == 0 && lexeme.id() == close_lexeme {
+            queue.push_back(lexeme); // Must push after borrow
             break;
         } else {
-            queue.push_back(lexeme);
+            queue.push_back(lexeme); // Must push after borrow
         }
         //println!("{:?} {} {}", lexeme, level, count);
     }
 }
 
-fn count_parsemes(queue: &Queue, start_level: usize, closer: Discriminant<Lexeme>) -> usize {
-    let mut level = start_level; // @TODO Maybe just use a signed number?
-    let mut iter = queue.iter();
-    let mut sum = 0;
-    while let Some(lexeme_ref) = iter.next() {
+fn verify_nesting(queue: &Queue) -> Result<(), String> {
+    enum O<'a> {
+        Fine,
+        Unclosed(L),
+        NoAssociated(&'a str, &'a str),
+    }
+
+    let mut stack = Vec::new();
+    let mut queue_iter = queue.iter();
+    while let Some(lexeme_ref) = queue_iter.next() {
         match lexeme_ref {
-            Lexeme::If | Lexeme::Do => level += 1,
-            Lexeme::EndIf | Lexeme::Done => level -= 1,
+            L::While => stack.push(L::While),
+            L::Until => stack.push(L::Until),
             _ => {}
         }
-        //println!("{:?}", lexeme_ref);
-        sum += match lexeme_ref {
-            Lexeme::EndOfCommand | Lexeme::SubShellClose => 1,
-            Lexeme::Then | Lexeme::Do | Lexeme::Done => 1, // Jumps
-            _ => 0,
+
+        let result = match lexeme_ref {
+            L::Do => match stack.pop() {
+                Some(L::For) | Some(L::While) | Some(L::Until) => {
+                    stack.push(L::Do);
+                    O::Fine
+                }
+                Some(l)
+                    if stack
+                        .iter()
+                        .any(|x| x.id() == L::While.id() || x.id() == L::Until.id()) =>
+                {
+                    O::Unclosed(l)
+                }
+                _ => O::NoAssociated("do", "'while', 'until', or 'for'"),
+            },
+            L::Done => match stack.pop() {
+                Some(L::Do) => O::Fine,
+                Some(l) if stack.iter().any(|x| x.id() == L::Do.id()) => O::Unclosed(l),
+                _ => O::NoAssociated("done", "'do'"),
+            },
+            _ => O::Fine,
         };
-        if level == 0 && discriminant(lexeme_ref) == closer {
+
+        match result {
+            O::Fine => {}
+            O::Unclosed(l) => return Err(format!("Close the '{:?}' first", l)),
+            O::NoAssociated(cur_lexeme, err) => {
+                return Err(format!(
+                    "Unexpected '{}' at <some location>, No associated {}",
+                    cur_lexeme, err,
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn count_parsemes(queue: &Queue, start_level: isize, closer: LexemeRepr) -> usize {
+    let mut iter = queue.iter();
+    let mut level = start_level; // @TODO Maybe just use a signed number?
+    let mut count = 0;
+    //println!("queue {:?}", queue);
+    while let Some(lexeme_ref) = iter.next() {
+        level += LEXEME_LEVEL[lexeme_ref.id() as usize] as isize;
+        count += LEXEME_PARSEME_COUNT[lexeme_ref.id() as usize] as usize;
+        //println!("{:?} {}", lexeme_ref, count);
+        if level == 0 && lexeme_ref.id() == closer {
             break;
         }
     }
-    sum
+    count
 }
 
 ////////////////////////////////////////////////////////////////////////////////

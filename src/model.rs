@@ -145,8 +145,7 @@ pub enum Parseme {
     JumpIfFalse(usize),
     JumpIfTrue(usize),
     Jump(usize),
-    External(Executable),
-    Debug(Vec<Lexeme>),
+    Statement(Executable),
 }
 
 //#[derive(Debug)]
