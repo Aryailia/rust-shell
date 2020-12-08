@@ -5,6 +5,8 @@
 * https://unicode.org/reports/tr29/#Grapheme_Cluster_Boundary_Rules[Grapheme Cluster Rules]
 * https://st.suckless.org/patches/sync[On doing vsync for the terminal]
 * https://github.com/iterm2/-/wikis/syncronized-updates-spec[Terminal sync protocol and escape sequence]
+* http://towo.net/mined/mined.html[The Mined text editor]
+* https://gitlab.freedesktop.org/terminal-wg/specifications/-/issues/9[Double width characters in Unicode 9+]
 
 * https://github.com/unicode-rs/unicode-width
 * https://github.com/unicode-rs/unicode-segmentation
